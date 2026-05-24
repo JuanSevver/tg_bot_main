@@ -7,11 +7,11 @@ services:
     # Переменная DATABASE_URL переопределяется здесь, чтобы БД
     # всегда лежала в именованном volume, а не внутри контейнера.
     environment:
-      DATABASE_URL: sqlite+aiosqlite:////data/bot.db
+      DATABASE_URL: sqlite+aiosqlite:////app/bot.db
 
     volumes:
-      # SQLite-база данных
-      - bot_data:/root/tg_bot_main/bot.db
+      # SQLite-база данных (bind-mount — работает с существующим файлом)
+      - ./bot.db:/app/bot.db
       # Telethon-сессии (содержат авторизацию парсера)
       - ./sessions:/app/sessions
 
