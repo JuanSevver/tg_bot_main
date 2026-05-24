@@ -91,6 +91,9 @@ class ParserManager:
         self._cycle: itertools.cycle = itertools.cycle([])
         self._bot: "Bot | None" = None
         self._running = False
+        # Зарегистрированные realtime-обработчики: client → list[handler_fn]
+        # Нужны чтобы снять их перед повторной регистрацией при reload_clients()
+        self._rt_handlers: dict[int, list] = {}  # id(client) → [fn, ...]
 
     @property
     def _clients(self) -> list[TelegramClient]:
@@ -114,6 +117,10 @@ class ParserManager:
                 pass
 
     async def reload_clients(self) -> None:
+        # Снимаем realtime-обработчики перед дисконнектом
+        for client, _ in self._client_pairs:
+            self._remove_rt_handlers(client)
+
         for c, _ in self._client_pairs:
             try:
                 await c.disconnect()
@@ -161,6 +168,134 @@ class ParserManager:
 
         self._cycle = itertools.cycle(self._client_pairs) if self._client_pairs else itertools.cycle([])
 
+        # Регистрируем realtime-обработчики после того как клиенты подключены
+        await self._register_realtime_handlers()
+
+    # ------------------------------------------------------------------
+    # Real-time event handlers (Telethon NewMessage)
+    # ------------------------------------------------------------------
+
+    def _remove_rt_handlers(self, client: TelegramClient) -> None:
+        """Снимает все ранее зарегистрированные realtime-обработчики с клиента."""
+        key = id(client)
+        for fn in self._rt_handlers.pop(key, []):
+            try:
+                client.remove_event_handler(fn)
+            except Exception:
+                pass
+
+    async def _register_realtime_handlers(self) -> None:
+        """Подписывает каждый Telethon-клиент на NewMessage.
+
+        Обработчик срабатывает мгновенно при появлении сообщения в любой
+        группе/канале, в которой состоит аккаунт. Дедупликация гарантирует
+        что то же сообщение не будет доставлено повторно страховочным поллингом.
+
+        Логика фильтрации по группам зеркалит поллинг:
+        - аккаунт без parse_joined_groups → только явно добавленные группы
+        - аккаунт с parse_joined_groups → все группы где он состоит
+        """
+        from telethon import events
+
+        # Загружаем явно добавленные группы (set chat_id'ов для быстрой проверки).
+        # Используем link→username, numeric id резолвится при первом обращении
+        # и кешируется Telethon; здесь храним нормализованные юзернеймы.
+        async with async_session() as session:
+            grp_result = await session.execute(
+                select(TelegramGroup).where(TelegramGroup.is_active == True)
+            )
+            explicit_groups: set[str] = {
+                _extract_username(g.link)
+                for g in grp_result.scalars().all()
+            }
+
+        # Карта acc_id → parse_joined_groups
+        acc_joined_flag: dict[int, bool] = {
+            acc_id: any(
+                acc_id == a_id
+                for _, a_id in self._joined_pairs
+            )
+            for _, acc_id in self._client_pairs
+        }
+
+        for client, acc_id in self._client_pairs:
+            self._remove_rt_handlers(client)  # чисто, без дублей при перезагрузке
+
+            parse_joined = acc_joined_flag.get(acc_id, False)
+
+            def _make_handler(bound_acc_id: int, bound_parse_joined: bool,
+                               bound_explicit: set[str]):
+                async def _handler(event):
+                    # Обрабатываем только группы и каналы, игнорируем личку/ботов
+                    if not (event.is_group or event.is_channel):
+                        return
+                    msg = event.message
+                    if not msg or not msg.text:
+                        return
+
+                    # Проверяем: входит ли чат в явно добавленные группы?
+                    # Если нет — обрабатываем только для аккаунтов с parse_joined_groups
+                    chat_username = getattr(event.chat, "username", None)
+                    norm = _extract_username(chat_username) if chat_username else ""
+                    is_explicit = norm in bound_explicit
+                    if not is_explicit and not bound_parse_joined:
+                        return
+
+                    try:
+                        async with async_session() as session:
+                            cats_result = await session.execute(
+                                select(Category).where(Category.is_active == True)
+                            )
+                            categories = cats_result.scalars().all()
+
+                            ca_result = await session.execute(select(CategoryAccount))
+                            cat_acc_map: dict[int, set[int]] = {}
+                            for ca in ca_result.scalars().all():
+                                cat_acc_map.setdefault(ca.category_id, set()).add(ca.account_id)
+
+                            # Фильтрация категорий по группе (group_cat_map)
+                            gc_result = await session.execute(select(GroupCategory))
+                            grp_cat_map: dict[int, list[Category]] = {}
+                            cat_by_id = {c.id: c for c in categories}
+                            for gc in gc_result.scalars().all():
+                                if gc.category_id in cat_by_id:
+                                    grp_cat_map.setdefault(gc.group_id, []).append(
+                                        cat_by_id[gc.category_id]
+                                    )
+
+                            # Ищем группу в БД по chat_id чтобы получить group_id
+                            # для group_cat_map; fallback — все категории
+                            applicable_cats = categories  # fallback
+                            if grp_cat_map:
+                                grp_db_result = await session.execute(
+                                    select(TelegramGroup).where(
+                                        TelegramGroup.is_active == True
+                                    )
+                                )
+                                for grp_db in grp_db_result.scalars().all():
+                                    grp_norm = _extract_username(grp_db.link)
+                                    if grp_norm == norm and grp_db.id in grp_cat_map:
+                                        applicable_cats = grp_cat_map[grp_db.id]
+                                        break
+
+                            await self._handle_message(
+                                session, msg, applicable_cats, bound_acc_id, cat_acc_map
+                            )
+                    except Exception as exc:
+                        logger.error(
+                            "Realtime handler error (acc %s, chat %s): %s",
+                            bound_acc_id, getattr(event, "chat_id", "?"), exc,
+                        )
+                return _handler
+
+            handler_fn = _make_handler(acc_id, parse_joined, explicit_groups)
+            client.add_event_handler(handler_fn, events.NewMessage)
+            self._rt_handlers.setdefault(id(client), []).append(handler_fn)
+            logger.info(
+                "Realtime handler registered for account_%s (parse_joined=%s).",
+                acc_id, parse_joined,
+            )
+
     # ------------------------------------------------------------------
     # Phone-based sign-in helpers
     # ------------------------------------------------------------------
@@ -195,12 +330,20 @@ class ParserManager:
     # ------------------------------------------------------------------
 
     async def _polling_loop(self) -> None:
+        """Страховочный поллинг — догоняет сообщения пропущенные при реконнекте.
+
+        Основная доставка идёт через realtime-обработчики (NewMessage event).
+        Этот цикл запускается раз в 5 минут и обрабатывает только то,
+        что не попало в event stream (обрыв соединения, FloodWait и т.п.).
+        """
+        # Первая итерация — сразу, чтобы подобрать историю после рестарта
+        await asyncio.sleep(5)
         while self._running:
             try:
                 await self._collect_messages()
             except Exception as e:
-                logger.error("Polling error: %s", e)
-            await asyncio.sleep(30)
+                logger.error("Catchup polling error: %s", e)
+            await asyncio.sleep(300)  # 5 минут
 
     async def _collect_messages(self) -> None:
         if not self._client_pairs:
