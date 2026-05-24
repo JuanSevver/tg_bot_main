@@ -11,7 +11,7 @@ services:
 
     volumes:
       # SQLite-база данных
-      - bot_data:/data
+      - bot_data:/root/tg_bot_main/bot.db
       # Telethon-сессии (содержат авторизацию парсера)
       - ./sessions:/app/sessions
 
