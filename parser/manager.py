@@ -21,7 +21,7 @@ from telethon.errors import (
     AuthKeyUnregisteredError, UserDeactivatedError, FloodWaitError,
     SessionPasswordNeededError,
 )
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.orm import selectinload
 
 from database.db import async_session
@@ -266,6 +266,19 @@ class ParserManager:
             except Exception as e:
                 logger.error("Error scanning joined groups: %s", e)
 
+    async def _get_last_seen_message_id(self, session, chat_id: int) -> int:
+        """Возвращает максимальный message_id который уже обработан для данного чата.
+
+        Возвращает 0 если группа обрабатывается впервые — тогда берём историю
+        на глубину INITIAL_HISTORY_LIMIT сообщений.
+        """
+        result = await session.execute(
+            select(func.max(ParsedMessage.message_id)).where(
+                ParsedMessage.group_id == chat_id
+            )
+        )
+        return result.scalar_one_or_none() or 0
+
     async def _process_group(
         self,
         client: TelegramClient,
@@ -274,6 +287,9 @@ class ParserManager:
         categories: list[Category],
         cat_acc_map: dict[int, set[int]],
     ) -> None:
+        # Глубина истории при первом добавлении группы (сообщений)
+        INITIAL_HISTORY_LIMIT = 500
+
         # Telethon принимает username (без @), полный URL t.me/... или числовой id
         target = group.link
         async with async_session() as session:
@@ -291,8 +307,21 @@ class ParserManager:
                         await session.commit()
                     group.is_channel = actually_channel  # обновляем и локальный объект
 
+                # Узнаём последнее обработанное сообщение для этого чата
+                chat_id = entity.id
+                last_seen_id = await self._get_last_seen_message_id(session, chat_id)
+
+                if last_seen_id > 0:
+                    # Инкрементальный режим: только новые сообщения после last_seen_id
+                    iter_kwargs = {"min_id": last_seen_id, "limit": None}
+                    logger.debug("Group %s: incremental from msg_id=%s", group.link, last_seen_id)
+                else:
+                    # Первый запуск: берём историю на INITIAL_HISTORY_LIMIT сообщений
+                    iter_kwargs = {"limit": INITIAL_HISTORY_LIMIT}
+                    logger.info("Group %s: first run, fetching last %s messages", group.link, INITIAL_HISTORY_LIMIT)
+
                 # Обычные сообщения группы / постов канала
-                async for message in client.iter_messages(entity, limit=50):
+                async for message in client.iter_messages(entity, **iter_kwargs):
                     if not message.text:
                         continue
                     await self._handle_message(session, message, categories, acc_id, cat_acc_map)
@@ -363,7 +392,13 @@ class ParserManager:
 
             try:
                 async with async_session() as session:
-                    async for message in client.iter_messages(chat_id, limit=50):
+                    last_seen_id = await self._get_last_seen_message_id(session, chat_id)
+                    if last_seen_id > 0:
+                        iter_kwargs = {"min_id": last_seen_id, "limit": None}
+                    else:
+                        iter_kwargs = {"limit": 500}
+
+                    async for message in client.iter_messages(chat_id, **iter_kwargs):
                         if not message.text:
                             continue
                         await self._handle_message(session, message, group_cats, acc_id, cat_acc_map)
