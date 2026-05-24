@@ -1,0 +1,26 @@
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+
+    # Переменная DATABASE_URL переопределяется здесь, чтобы БД
+    # всегда лежала в именованном volume, а не внутри контейнера.
+    environment:
+      DATABASE_URL: sqlite+aiosqlite:////data/bot.db
+
+    volumes:
+      # SQLite-база данных
+      - bot_data:/data
+      # Telethon-сессии (содержат авторизацию парсера)
+      - ./sessions:/app/sessions
+
+    # Логи: последние 50 МБ, не больше 5 файлов
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+volumes:
+  bot_data:

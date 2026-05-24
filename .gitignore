@@ -1,0 +1,21 @@
+# Секреты
+.env
+
+# База данных
+*.db
+*.db-shm
+*.db-wal
+
+# Telethon-сессии (содержат авторизацию!)
+sessions/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+dist/
+*.egg-info/
+
+# Pytest
+.pytest_cache/
