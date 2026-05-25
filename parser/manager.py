@@ -358,6 +358,89 @@ class ParserManager:
         return ss
 
     # ------------------------------------------------------------------
+    # Join groups (admin tools)
+    # ------------------------------------------------------------------
+
+    async def join_group(self, link_or_chat_id) -> dict:
+        """Подписывает все парсерные аккаунты на группу/канал по ссылке.
+
+        Возвращает словарь {acc_id: status}, где status — одна из строк:
+        "joined", "already", "error: <текст>".
+
+        Поддерживает:
+        - публичные username/ссылки (`@x`, `t.me/x`, `https://t.me/x`)
+        - приватные инвайт-ссылки (`t.me/+abc`, `t.me/joinchat/abc`)
+        - числовой chat_id (если бот уже резолвил группу)
+        """
+        from telethon.tl.functions.channels import JoinChannelRequest
+        from telethon.tl.functions.messages import ImportChatInviteRequest
+        from telethon.errors import (
+            UserAlreadyParticipantError, InviteHashExpiredError,
+            InviteHashInvalidError, ChannelsTooMuchError,
+        )
+
+        result: dict[int, str] = {}
+        link = str(link_or_chat_id).strip()
+        invite_hash: str | None = None
+
+        # Распознаём инвайт-ссылку: t.me/+xxx или t.me/joinchat/xxx
+        for prefix in ("https://t.me/", "http://t.me/", "t.me/"):
+            if link.startswith(prefix):
+                tail = link[len(prefix):]
+                if tail.startswith("+"):
+                    invite_hash = tail[1:].split("?")[0].split("/")[0]
+                elif tail.startswith("joinchat/"):
+                    invite_hash = tail[len("joinchat/"):].split("?")[0].split("/")[0]
+                break
+
+        for client, acc_id in self._client_pairs:
+            try:
+                if invite_hash:
+                    try:
+                        await client(ImportChatInviteRequest(invite_hash))
+                        result[acc_id] = "joined"
+                    except UserAlreadyParticipantError:
+                        result[acc_id] = "already"
+                else:
+                    # публичная группа/канал или числовой id
+                    target = link_or_chat_id
+                    if isinstance(target, str):
+                        # обрезаем префиксы и @ — Telethon принимает чистый username
+                        t = target
+                        for prefix in ("https://t.me/", "http://t.me/", "t.me/"):
+                            if t.startswith(prefix):
+                                t = t[len(prefix):]
+                                break
+                        t = t.lstrip("@").split("/")[0].split("?")[0]
+                        target = t
+                    try:
+                        await client(JoinChannelRequest(target))
+                        result[acc_id] = "joined"
+                    except UserAlreadyParticipantError:
+                        result[acc_id] = "already"
+            except FloodWaitError as e:
+                result[acc_id] = f"floodwait {e.seconds}s"
+                logger.warning("FloodWait %s sec joining %s acc=%s", e.seconds, link, acc_id)
+                await asyncio.sleep(min(e.seconds, 10))
+            except (InviteHashExpiredError, InviteHashInvalidError) as e:
+                result[acc_id] = f"bad invite: {type(e).__name__}"
+            except ChannelsTooMuchError:
+                result[acc_id] = "лимит каналов превышен"
+            except Exception as e:
+                result[acc_id] = f"error: {type(e).__name__}: {e}"
+                logger.debug("Join %s via acc %s failed: %s", link, acc_id, e)
+            await asyncio.sleep(0.5)  # лёгкий троттлинг чтобы не словить FloodWait
+
+        # После массового вступления имеет смысл обновить realtime-фильтр —
+        # у группы мог появиться chat_id (если резолвится через get_entity)
+        try:
+            await self._refresh_explicit_filter()
+        except Exception:
+            pass
+
+        return result
+
+    # ------------------------------------------------------------------
     # Polling loop
     # ------------------------------------------------------------------
 

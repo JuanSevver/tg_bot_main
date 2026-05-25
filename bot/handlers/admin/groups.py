@@ -246,22 +246,96 @@ async def process_group_link(message: Message, state: FSMContext, session: Async
     session.add(group)
     await session.commit()
 
-    # Сразу обновляем realtime-фильтр, чтобы новая группа ловилась мгновенно,
-    # а не только после следующего цикла полла.
+    # Автоматически подписываем все парсерные аккаунты на новую группу.
+    # Без этого realtime-события Telegram не присылает — он шлёт NewMessage
+    # только участникам. _refresh_explicit_filter вызывается внутри join_group.
+    join_summary = ""
     try:
         from parser.manager import parser_manager
-        await parser_manager._refresh_explicit_filter()
-    except Exception:
-        pass
+        join_result = await parser_manager.join_group(link)
+        joined = sum(1 for v in join_result.values() if v in ("joined", "already"))
+        total = len(join_result)
+        join_summary = f"\n👥 Аккаунтов подписано: {joined}/{total}"
+        # Если хоть кто-то не смог — покажем кратко, чтобы было видно проблему
+        failures = [f"acc_{a}: {v}" for a, v in join_result.items()
+                    if v not in ("joined", "already")]
+        if failures:
+            join_summary += "\n⚠️ " + "; ".join(failures[:3])
+    except Exception as e:
+        join_summary = f"\n⚠️ Авто-подписка не удалась: {e}"
 
     type_label = "📢 Канал" if is_channel else "👥 Группа"
     display = title or link
     result2 = await session.execute(select(TelegramGroup).order_by(TelegramGroup.added_at.desc()))
     groups = result2.scalars().all()
     await message.answer(
-        f"✅ {type_label} <b>{display}</b> добавлен(а).\n\n"
+        f"✅ {type_label} <b>{display}</b> добавлен(а).{join_summary}\n\n"
         f"🔗 <b>Группы/каналы</b> ({len(groups)})",
         reply_markup=groups_list_kb(list(groups)),
         parse_mode="HTML",
     )
     await state.set_state(GroupSG.list)
+
+
+# ── Массовое вступление всех аккаунтов во все активные группы ─────────────────
+
+@router.callback_query(F.data == "adm:grp:joinall")
+async def cb_groups_join_all(callback: CallbackQuery, session: AsyncSession) -> None:
+    """Прогоняет join_group для каждой активной группы.
+
+    Полезно после: (а) добавления новых аккаунтов, (б) если группы добавляли
+    в БД руками, (в) после перевыдачи сессии. Идемпотентно — повторные вызовы
+    дают "already" для уже вступлённых, ничего не ломается.
+    """
+    result = await session.execute(
+        select(TelegramGroup).where(TelegramGroup.is_active == True)
+    )
+    groups = result.scalars().all()
+    if not groups:
+        await callback.answer("Нет активных групп.", show_alert=True)
+        return
+
+    await callback.message.edit_text(
+        f"⏳ Подписываю аккаунты на {len(groups)} групп... Это может занять минуту.",
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+    from parser.manager import parser_manager
+    stats = {"joined": 0, "already": 0, "failed": 0}
+    failures: list[str] = []
+
+    for grp in groups:
+        try:
+            res = await parser_manager.join_group(grp.link)
+        except Exception as e:
+            failures.append(f"{grp.link}: {type(e).__name__}")
+            stats["failed"] += 1
+            continue
+        for status in res.values():
+            if status == "joined":
+                stats["joined"] += 1
+            elif status == "already":
+                stats["already"] += 1
+            else:
+                stats["failed"] += 1
+                if len(failures) < 8:
+                    failures.append(f"{grp.link[:40]}: {status[:40]}")
+
+    summary = (
+        f"✅ Готово.\n\n"
+        f"Новых вступлений: <b>{stats['joined']}</b>\n"
+        f"Уже состояли: <b>{stats['already']}</b>\n"
+        f"Не удалось: <b>{stats['failed']}</b>"
+    )
+    if failures:
+        summary += "\n\n⚠️ Проблемы:\n" + "\n".join(f"• {f}" for f in failures)
+
+    result2 = await session.execute(
+        select(TelegramGroup).order_by(TelegramGroup.added_at.desc())
+    )
+    await callback.message.answer(
+        summary + f"\n\n🔗 <b>Группы/каналы</b> ({len(groups)})",
+        reply_markup=groups_list_kb(list(result2.scalars().all())),
+        parse_mode="HTML",
+    )

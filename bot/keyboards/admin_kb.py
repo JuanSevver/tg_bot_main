@@ -97,6 +97,12 @@ def groups_list_kb(groups: list[TelegramGroup]) -> InlineKeyboardMarkup:
             )
         )
     builder.row(InlineKeyboardButton(text="➕ Добавить группу", callback_data="adm:grp:add", style="primary"))
+    if groups:
+        builder.row(InlineKeyboardButton(
+            text="👥 Подписать все аккаунты на все группы",
+            callback_data="adm:grp:joinall",
+            style="primary",
+        ))
     builder.row(InlineKeyboardButton(text="◀ Назад", callback_data="adm:main", style="primary"))
     return builder.as_markup()
 
