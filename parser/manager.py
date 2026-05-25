@@ -19,8 +19,8 @@ from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.utils import get_peer_id
 from telethon.errors import (
-    AuthKeyUnregisteredError, UserDeactivatedError, FloodWaitError,
-    SessionPasswordNeededError,
+    AuthKeyUnregisteredError, AuthKeyDuplicatedError, UserDeactivatedError,
+    UserDeactivatedBanError, FloodWaitError, SessionPasswordNeededError,
 )
 from sqlalchemy import select, func
 from sqlalchemy.orm import selectinload
@@ -167,16 +167,30 @@ class ParserManager:
                 if acc.parse_joined_groups:
                     self._joined_pairs.append((client, acc.id))
                 logger.info("Parser client account_%s started (joined=%s).", acc.id, acc.parse_joined_groups)
-            except (AuthKeyUnregisteredError, UserDeactivatedError):
+            except (
+                AuthKeyUnregisteredError, AuthKeyDuplicatedError,
+                UserDeactivatedError, UserDeactivatedBanError,
+            ) as e:
                 async with async_session() as db:
                     r = await db.execute(select(ParserAccount).where(ParserAccount.id == acc.id))
                     a = r.scalar_one_or_none()
                     if a:
                         a.is_valid = False
                         await db.commit()
-                logger.warning("Account %s invalid, marked.", acc.id)
+                logger.warning(
+                    "Account %s marked invalid (%s). Re-authorize via admin panel.",
+                    acc.id, type(e).__name__,
+                )
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
             except Exception as e:
                 logger.error("Failed to start client for account %s: %s", acc.id, e)
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
 
         self._cycle = itertools.cycle(self._client_pairs) if self._client_pairs else itertools.cycle([])
 
