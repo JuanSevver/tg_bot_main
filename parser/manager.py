@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 
 from telethon import TelegramClient
 from telethon.sessions import StringSession
+from telethon.utils import get_peer_id
 from telethon.errors import (
     AuthKeyUnregisteredError, UserDeactivatedError, FloodWaitError,
     SessionPasswordNeededError,
@@ -94,6 +95,10 @@ class ParserManager:
         # Зарегистрированные realtime-обработчики: client → list[handler_fn]
         # Нужны чтобы снять их перед повторной регистрацией при reload_clients()
         self._rt_handlers: dict[int, list] = {}  # id(client) → [fn, ...]
+        # Кеш: group.id → acc_id клиента который умеет резолвить эту группу.
+        # Заполняется при первом удачном get_entity и переиспользуется,
+        # вместо слепого round-robin (который попадает мимо для приватных групп).
+        self._group_owner: dict[int, int] = {}
 
     @property
     def _clients(self) -> list[TelegramClient]:
@@ -128,6 +133,7 @@ class ParserManager:
                 pass
         self._client_pairs.clear()
         self._joined_pairs.clear()
+        self._group_owner.clear()
 
         async with async_session() as session:
             result = await session.execute(
@@ -197,17 +203,22 @@ class ParserManager:
         """
         from telethon import events
 
-        # Загружаем явно добавленные группы (set chat_id'ов для быстрой проверки).
-        # Используем link→username, numeric id резолвится при первом обращении
-        # и кешируется Telethon; здесь храним нормализованные юзернеймы.
+        # Загружаем явно добавленные группы. Сравниваем по chat_id (Telethon
+        # peer id вида -100...) — это надёжно для приватных групп без username
+        # и для каналов. Username держим как запасной матчинг для случая,
+        # когда chat_id ещё не успел резолвиться при добавлении группы.
         async with async_session() as session:
             grp_result = await session.execute(
                 select(TelegramGroup).where(TelegramGroup.is_active == True)
             )
-            explicit_groups: set[str] = {
-                _extract_username(g.link)
-                for g in grp_result.scalars().all()
-            }
+            explicit_chat_ids: set[int] = set()
+            explicit_usernames: set[str] = set()
+            for g in grp_result.scalars().all():
+                if g.chat_id:
+                    explicit_chat_ids.add(g.chat_id)
+                norm = _extract_username(g.link)
+                if norm and not norm.startswith("+") and "joinchat" not in norm:
+                    explicit_usernames.add(norm)
 
         # Карта acc_id → parse_joined_groups
         acc_joined_flag: dict[int, bool] = {
@@ -224,7 +235,7 @@ class ParserManager:
             parse_joined = acc_joined_flag.get(acc_id, False)
 
             def _make_handler(bound_acc_id: int, bound_parse_joined: bool,
-                               bound_explicit: set[str]):
+                               bound_chat_ids: set[int], bound_usernames: set[str]):
                 async def _handler(event):
                     # Обрабатываем только группы и каналы, игнорируем личку/ботов
                     if not (event.is_group or event.is_channel):
@@ -234,10 +245,14 @@ class ParserManager:
                         return
 
                     # Проверяем: входит ли чат в явно добавленные группы?
-                    # Если нет — обрабатываем только для аккаунтов с parse_joined_groups
-                    chat_username = getattr(event.chat, "username", None)
-                    norm = _extract_username(chat_username) if chat_username else ""
-                    is_explicit = norm in bound_explicit
+                    # Матчим по chat_id (надёжно для приватных), c username-фолбэком.
+                    is_explicit = event.chat_id in bound_chat_ids
+                    if not is_explicit and bound_usernames:
+                        chat = getattr(event, "chat", None)
+                        chat_username = getattr(chat, "username", None) if chat else None
+                        if chat_username:
+                            norm = _extract_username(chat_username)
+                            is_explicit = norm in bound_usernames
                     if not is_explicit and not bound_parse_joined:
                         return
 
@@ -263,18 +278,25 @@ class ParserManager:
                                         cat_by_id[gc.category_id]
                                     )
 
-                            # Ищем группу в БД по chat_id чтобы получить group_id
-                            # для group_cat_map; fallback — все категории
+                            # Ищем группу в БД (по chat_id, затем по username)
+                            # чтобы получить group_id для grp_cat_map; fallback — все категории
                             applicable_cats = categories  # fallback
                             if grp_cat_map:
+                                chat = getattr(event, "chat", None)
+                                chat_username = getattr(chat, "username", None) if chat else None
+                                norm = _extract_username(chat_username) if chat_username else ""
                                 grp_db_result = await session.execute(
                                     select(TelegramGroup).where(
                                         TelegramGroup.is_active == True
                                     )
                                 )
                                 for grp_db in grp_db_result.scalars().all():
-                                    grp_norm = _extract_username(grp_db.link)
-                                    if grp_norm == norm and grp_db.id in grp_cat_map:
+                                    matched = False
+                                    if grp_db.chat_id and grp_db.chat_id == event.chat_id:
+                                        matched = True
+                                    elif norm and _extract_username(grp_db.link) == norm:
+                                        matched = True
+                                    if matched and grp_db.id in grp_cat_map:
                                         applicable_cats = grp_cat_map[grp_db.id]
                                         break
 
@@ -288,7 +310,7 @@ class ParserManager:
                         )
                 return _handler
 
-            handler_fn = _make_handler(acc_id, parse_joined, explicit_groups)
+            handler_fn = _make_handler(acc_id, parse_joined, explicit_chat_ids, explicit_usernames)
             client.add_event_handler(handler_fn, events.NewMessage)
             self._rt_handlers.setdefault(id(client), []).append(handler_fn)
             logger.info(
@@ -383,18 +405,39 @@ class ParserManager:
         }
         explicit_links: set[str] = set(link_to_group.keys())
 
-        # 1. Явно добавленные группы (round-robin по клиентам)
+        # 1. Явно добавленные группы — пробуем клиентов по очереди, пока
+        # кто-то не сможет резолвить entity (приватные группы видны только
+        # тем аккаунтам, что в них состоят). Первого успешного запоминаем
+        # в self._group_owner, чтобы в следующий цикл идти к нему сразу.
         for group in groups:
-            client, acc_id = next(self._cycle)
-            # Используем категории группы; если не назначены — все категории
             group_cats = group_cat_map.get(group.id) or categories
-            try:
-                await self._process_group(client, acc_id, group, group_cats, cat_acc_map)
-            except FloodWaitError as e:
-                logger.warning("FloodWait %s sec for %s", e.seconds, group.link)
-                await asyncio.sleep(e.seconds)
-            except Exception as e:
-                logger.error("Error processing group %s: %s", group.link, e)
+            owner_acc_id = self._group_owner.get(group.id)
+
+            ordered: list[tuple[TelegramClient, int]] = []
+            if owner_acc_id is not None:
+                for pair in self._client_pairs:
+                    if pair[1] == owner_acc_id:
+                        ordered.append(pair)
+                        break
+            for pair in self._client_pairs:
+                if pair not in ordered:
+                    ordered.append(pair)
+
+            handled = False
+            for client, acc_id in ordered:
+                try:
+                    ok = await self._process_group(client, acc_id, group, group_cats, cat_acc_map)
+                    if ok:
+                        self._group_owner[group.id] = acc_id
+                        handled = True
+                        break
+                except FloodWaitError as e:
+                    logger.warning("FloodWait %s sec for %s", e.seconds, group.link)
+                    await asyncio.sleep(e.seconds)
+                except Exception as e:
+                    logger.debug("Group %s via acc %s failed: %s", group.link, acc_id, e)
+            if not handled:
+                logger.warning("Group %s: no account could access it", group.link)
 
         # 2. Группы в которых состоят аккаунты с parse_joined_groups=True
         for client, acc_id in self._joined_pairs:
@@ -429,12 +472,15 @@ class ParserManager:
         group: TelegramGroup,
         categories: list[Category],
         cat_acc_map: dict[int, set[int]],
-    ) -> None:
+    ) -> bool:
+        """Парсит сообщения из группы. Возвращает True если entity отрезолвился."""
         # Глубина истории при первом добавлении группы (сообщений)
         INITIAL_HISTORY_LIMIT = 500
 
-        # Telethon принимает username (без @), полный URL t.me/... или числовой id
-        target = group.link
+        # Telethon принимает username (без @), полный URL t.me/... или числовой id.
+        # Если у нас уже есть resolved chat_id — используем его (быстрее и работает
+        # для приватных групп даже без актуального инвайт-токена в кэше).
+        target = group.chat_id if group.chat_id else group.link
         async with async_session() as session:
             try:
                 # Определяем тип группы при первом обходе (канал или нет)
@@ -442,17 +488,21 @@ class ParserManager:
                 from telethon.tl.types import Channel
                 actually_channel = isinstance(entity, Channel) and entity.broadcast
 
-                # Если тип изменился с момента добавления — обновляем в БД
-                if group.is_channel != actually_channel:
+                # Нормализованный peer id вида -100... — совпадает с message.chat_id
+                resolved_chat_id = get_peer_id(entity)
+
+                # Если в БД ещё нет chat_id или тип изменился — сохраняем
+                if group.chat_id != resolved_chat_id or group.is_channel != actually_channel:
                     db_grp = await session.get(TelegramGroup, group.id)
                     if db_grp:
+                        db_grp.chat_id = resolved_chat_id
                         db_grp.is_channel = actually_channel
                         await session.commit()
-                    group.is_channel = actually_channel  # обновляем и локальный объект
+                    group.chat_id = resolved_chat_id
+                    group.is_channel = actually_channel
 
-                # Узнаём последнее обработанное сообщение для этого чата
-                chat_id = entity.id
-                last_seen_id = await self._get_last_seen_message_id(session, chat_id)
+                # last_seen_id ищем по тому же peer id, что хранится в ParsedMessage
+                last_seen_id = await self._get_last_seen_message_id(session, resolved_chat_id)
 
                 if last_seen_id > 0:
                     # Инкрементальный режим: только новые сообщения после last_seen_id
@@ -483,10 +533,12 @@ class ParserManager:
                                 await self._handle_message(session, comment, categories, acc_id, cat_acc_map)
                         except Exception:
                             pass  # Не все каналы открыты для чтения комментариев
+                return True
             except FloodWaitError:
                 raise  # Пробрасываем — обрабатывается в _collect_messages
             except Exception as e:
-                logger.warning("Could not process group %s: %s", group.link, e)
+                logger.debug("Could not process group %s via acc %s: %s", group.link, acc_id, e)
+                return False
 
     async def _process_joined_groups(
         self,
@@ -523,7 +575,12 @@ class ParserManager:
             if norm_username and norm_username in skip_links:
                 continue
 
-            chat_id = dialog.id
+            # Используем нормализованный peer id (тот же формат, что у
+            # message.chat_id) — иначе last_seen_id никогда не совпадёт.
+            try:
+                chat_id = get_peer_id(entity)
+            except Exception:
+                chat_id = dialog.id
             is_channel = dialog.is_channel and not dialog.is_group
 
             # Выбираем категории: если группа есть в БД с назначенными → используем их

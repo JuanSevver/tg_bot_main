@@ -218,21 +218,31 @@ async def process_group_link(message: Message, state: FSMContext, session: Async
         await message.answer("⚠️ Эта группа уже добавлена.", reply_markup=cancel_kb("adm:groups", "◀ К списку групп"))
         return
 
-    # Пробуем определить название и тип через парсер
+    # Пробуем определить название/тип/chat_id через парсер.
+    # Перебираем ВСЕ аккаунты — приватную группу видит только тот, кто в ней.
     title: str | None = None
     is_channel = False
+    chat_id: int | None = None
     try:
         from parser.manager import parser_manager
         from telethon.tl.types import Channel
-        clients = parser_manager._clients
-        if clients:
-            entity = await clients[0].get_entity(link)
-            title = getattr(entity, "title", None)
+        from telethon.utils import get_peer_id
+        for client in parser_manager._clients:
+            try:
+                entity = await client.get_entity(link)
+            except Exception:
+                continue
+            title = getattr(entity, "title", None) or title
             is_channel = isinstance(entity, Channel) and entity.broadcast
+            try:
+                chat_id = get_peer_id(entity)
+            except Exception:
+                chat_id = None
+            break
     except Exception:
-        pass  # Нет аккаунтов или ссылка нерабочая — добавим без метаданных
+        pass  # Нет аккаунтов — добавим без метаданных, резолв будет в _process_group
 
-    group = TelegramGroup(link=link, title=title, is_channel=is_channel)
+    group = TelegramGroup(link=link, title=title, is_channel=is_channel, chat_id=chat_id)
     session.add(group)
     await session.commit()
 

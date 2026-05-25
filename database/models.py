@@ -119,6 +119,10 @@ class TelegramGroup(Base):
     is_channel: Mapped[bool] = mapped_column(Boolean, default=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     added_at: Mapped[datetime] = mapped_column(DateTime, default=func.now())
+    # Telethon peer id вида -100... (для каналов/супергрупп) или просто id (для basic group).
+    # Резолвится при добавлении группы любым клиентом, который смог увидеть entity.
+    # Используется для realtime-фильтрации и инкрементального полла.
+    chat_id: Mapped[int | None] = mapped_column(BigInteger, index=True)
 
     categories: Mapped[list[GroupCategory]] = relationship("GroupCategory", back_populates="group")
 
