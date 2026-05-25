@@ -161,29 +161,58 @@ async def cb_proxy_check(callback: CallbackQuery, session: AsyncSession) -> None
         proxy_url += f"{proxy.username}:{proxy.password}@"
     proxy_url += f"{proxy.host}:{proxy.port}"
 
-    is_working = False
+    # Проверяем: (1) ходит ли трафик вообще, (2) доступен ли Telegram DC.
+    # Второе важнее — httpbin может отвечать, а Telegram через тот же прокси нет.
+    internet_ok = False
+    telegram_ok = False
+    error_msg: str | None = None
     try:
         if proxy.type.lower() in ("socks5", "socks4"):
             connector = ProxyConnector.from_url(proxy_url)
+            http_proxy_arg = None
         else:
             connector = aiohttp.TCPConnector()
+            http_proxy_arg = proxy_url
 
-        async with aiohttp.ClientSession(connector=connector) as s:
-            kwargs = {"timeout": aiohttp.ClientTimeout(total=10)}
-            if proxy.type.lower() == "http":
-                kwargs["proxy"] = proxy_url
-            async with s.get("https://httpbin.org/ip", **kwargs) as resp:
-                is_working = resp.status == 200
-    except Exception:
-        is_working = False
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as s:
+            # 1) ходит ли HTTPS наружу
+            try:
+                kwargs = {"proxy": http_proxy_arg} if http_proxy_arg else {}
+                async with s.get("https://api.ipify.org", **kwargs) as resp:
+                    internet_ok = resp.status == 200
+            except Exception as e:
+                error_msg = f"интернет: {type(e).__name__}"
 
+            # 2) виден ли Telegram через этот же прокси (DC2)
+            try:
+                kwargs = {"proxy": http_proxy_arg} if http_proxy_arg else {}
+                async with s.get("https://149.154.167.51/", **kwargs, ssl=False) as resp:
+                    # Любой HTTP-ответ = TCP+TLS до Telegram прошёл
+                    telegram_ok = resp.status in (200, 400, 404, 501)
+            except Exception as e:
+                if not error_msg:
+                    error_msg = f"telegram: {type(e).__name__}"
+    except Exception as e:
+        error_msg = f"connector: {type(e).__name__}"
+
+    is_working = internet_ok and telegram_ok
     proxy.is_working = is_working
     proxy.last_checked_at = datetime.utcnow()
     await session.commit()
 
     result2 = await session.execute(select(Proxy))
     proxies = result2.scalars().all()
-    status = "✅ работает" if is_working else "❌ не работает"
+
+    if is_working:
+        status = "✅ работает (Telegram доступен)"
+    elif internet_ok and not telegram_ok:
+        status = "⚠️ интернет есть, но Telegram заблокирован"
+    elif not internet_ok and telegram_ok:
+        status = "⚠️ Telegram доступен, но HTTPS нестабилен"
+    else:
+        status = f"❌ не работает ({error_msg or 'таймаут'})"
+
     await callback.message.edit_text(
         f"Прокси {proxy.host}:{proxy.port} — {status}\n\n🛡 <b>Прокси</b>",
         reply_markup=proxies_list_kb(list(proxies)),
