@@ -99,6 +99,12 @@ class ParserManager:
         # Заполняется при первом удачном get_entity и переиспользуется,
         # вместо слепого round-robin (который попадает мимо для приватных групп).
         self._group_owner: dict[int, int] = {}
+        # Изменяемые наборы для realtime-фильтра. Хендлеры читают их по ссылке,
+        # поэтому достаточно обновлять содержимое — повторно регистрировать
+        # обработчики не нужно. Пополняются при старте и после каждого полла,
+        # когда у новых приватных групп резолвится chat_id.
+        self._explicit_chat_ids: set[int] = set()
+        self._explicit_usernames: set[str] = set()
 
     @property
     def _clients(self) -> list[TelegramClient]:
@@ -205,20 +211,10 @@ class ParserManager:
 
         # Загружаем явно добавленные группы. Сравниваем по chat_id (Telethon
         # peer id вида -100...) — это надёжно для приватных групп без username
-        # и для каналов. Username держим как запасной матчинг для случая,
-        # когда chat_id ещё не успел резолвиться при добавлении группы.
-        async with async_session() as session:
-            grp_result = await session.execute(
-                select(TelegramGroup).where(TelegramGroup.is_active == True)
-            )
-            explicit_chat_ids: set[int] = set()
-            explicit_usernames: set[str] = set()
-            for g in grp_result.scalars().all():
-                if g.chat_id:
-                    explicit_chat_ids.add(g.chat_id)
-                norm = _extract_username(g.link)
-                if norm and not norm.startswith("+") and "joinchat" not in norm:
-                    explicit_usernames.add(norm)
+        # и для каналов. Username держим как запасной матчинг.
+        # Наборы — instance attrs: handler читает по ссылке, поэтому
+        # достаточно обновить их в _refresh_explicit_filter() без re-register.
+        await self._refresh_explicit_filter()
 
         # Карта acc_id → parse_joined_groups
         acc_joined_flag: dict[int, bool] = {
@@ -310,7 +306,7 @@ class ParserManager:
                         )
                 return _handler
 
-            handler_fn = _make_handler(acc_id, parse_joined, explicit_chat_ids, explicit_usernames)
+            handler_fn = _make_handler(acc_id, parse_joined, self._explicit_chat_ids, self._explicit_usernames)
             client.add_event_handler(handler_fn, events.NewMessage)
             self._rt_handlers.setdefault(id(client), []).append(handler_fn)
             logger.info(
@@ -351,6 +347,33 @@ class ParserManager:
     # Polling loop
     # ------------------------------------------------------------------
 
+    async def _refresh_explicit_filter(self) -> None:
+        """Обновляет наборы chat_id / username для realtime-фильтра.
+
+        Хендлеры держат ссылки на self._explicit_chat_ids / _explicit_usernames,
+        поэтому повторно регистрировать обработчики не нужно: меняем содержимое
+        наборов in-place, и фильтр сразу видит новые chat_id (например, после
+        первого полла, когда у приватных групп резолвится peer id).
+        """
+        async with async_session() as session:
+            grp_result = await session.execute(
+                select(TelegramGroup).where(TelegramGroup.is_active == True)
+            )
+            new_chat_ids: set[int] = set()
+            new_usernames: set[str] = set()
+            for g in grp_result.scalars().all():
+                if g.chat_id:
+                    new_chat_ids.add(g.chat_id)
+                norm = _extract_username(g.link)
+                if norm and not norm.startswith("+") and "joinchat" not in norm:
+                    new_usernames.add(norm)
+
+        # in-place — чтобы хендлеры, держащие ссылку, увидели изменения
+        self._explicit_chat_ids.clear()
+        self._explicit_chat_ids.update(new_chat_ids)
+        self._explicit_usernames.clear()
+        self._explicit_usernames.update(new_usernames)
+
     async def _polling_loop(self) -> None:
         """Страховочный поллинг — догоняет сообщения пропущенные при реконнекте.
 
@@ -363,6 +386,9 @@ class ParserManager:
         while self._running:
             try:
                 await self._collect_messages()
+                # После полла у приватных групп мог появиться chat_id —
+                # обновляем фильтр realtime, чтобы они начали ловиться мгновенно.
+                await self._refresh_explicit_filter()
             except Exception as e:
                 logger.error("Catchup polling error: %s", e)
             await asyncio.sleep(300)  # 5 минут

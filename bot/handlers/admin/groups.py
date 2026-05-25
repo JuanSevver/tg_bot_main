@@ -246,6 +246,14 @@ async def process_group_link(message: Message, state: FSMContext, session: Async
     session.add(group)
     await session.commit()
 
+    # Сразу обновляем realtime-фильтр, чтобы новая группа ловилась мгновенно,
+    # а не только после следующего цикла полла.
+    try:
+        from parser.manager import parser_manager
+        await parser_manager._refresh_explicit_filter()
+    except Exception:
+        pass
+
     type_label = "📢 Канал" if is_channel else "👥 Группа"
     display = title or link
     result2 = await session.execute(select(TelegramGroup).order_by(TelegramGroup.added_at.desc()))
