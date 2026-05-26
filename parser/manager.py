@@ -116,27 +116,48 @@ def _text_hash(text: str) -> str:
 
 
 class _GlobalSendLimiter:
-    """Глобальный токен-бакет на исходящие send_message.
+    """Глобальный токен-бакет + RetryAfter-aware pause.
 
-    Без него при нескольких параллельных _deliver_message каждый спит 0.04с
-    отдельно, и суммарный rate легко превышает 30/сек → каскад TelegramRetryAfter.
-    Один общий лимитер сериализует выдачу токенов и держит общий потолок.
+    Две задачи:
+    1) Сериализовать выдачу токенов: при нескольких параллельных _deliver_message
+       суммарный rate не превышает rate_per_sec/сек. Без этого 5 параллельных
+       доставок по 25 msg/сек дают 125 msg/сек → каскад RetryAfter.
+    2) Если Telegram прислал RetryAfter (per-bot троттл), ВСЕ pending sends
+       должны подождать общую паузу. Раньше каждый _deliver_message спал свой
+       retry_after отдельно — остальные параллельные доставки продолжали слать
+       в throttle, получали тот же RetryAfter, удлиняли его, и накапливался
+       backoff в десятки минут.
     """
 
     def __init__(self, rate_per_sec: int) -> None:
         self._interval = 1.0 / rate_per_sec
         self._lock = asyncio.Lock()
         self._next_at = 0.0
+        # Абсолютное loop.time() до которого все send'ы заблокированы из-за RetryAfter.
+        # Когда любой sender ловит TelegramRetryAfter, он зовёт pause_until() — и
+        # все остальные acquire() уйдут спать до того же момента.
+        self._paused_until: float = 0.0
 
     async def acquire(self) -> None:
         async with self._lock:
             loop = asyncio.get_event_loop()
             now = loop.time()
+            # Глобальная пауза от RetryAfter — приоритетнее, чем токен-интервал.
+            if self._paused_until > now:
+                await asyncio.sleep(self._paused_until - now)
+                now = loop.time()
             wait = self._next_at - now
             if wait > 0:
                 await asyncio.sleep(wait)
                 now = loop.time()
             self._next_at = max(now, self._next_at) + self._interval
+
+    def pause(self, seconds: float) -> None:
+        """Заявить глобальную паузу — все следующие acquire() будут её ждать."""
+        loop = asyncio.get_event_loop()
+        new_until = loop.time() + max(0.0, seconds)
+        if new_until > self._paused_until:
+            self._paused_until = new_until
 
 
 _send_limiter = _GlobalSendLimiter(GLOBAL_SEND_RATE_PER_SEC)
@@ -1155,16 +1176,14 @@ class ParserManager:
                 )
                 delivered_user_ids.append(user_id)
             except TelegramRetryAfter as e:
-                logger.warning("RetryAfter %s sec, pausing delivery.", e.retry_after)
-                await asyncio.sleep(e.retry_after)
-                try:
-                    await _send_limiter.acquire()
-                    await self._bot.send_message(
-                        user_id, text, reply_markup=kb, parse_mode="HTML",
-                    )
-                    delivered_user_ids.append(user_id)
-                except Exception:
-                    pass
+                # Telegram per-bot throttle. Сообщаем лимитеру — он притормозит
+                # ВСЕ параллельные доставки на ту же паузу, чтобы они не
+                # продолжали долбить API и не удлиняли backoff.
+                logger.warning("RetryAfter %s sec, pausing all delivery globally.", e.retry_after)
+                _send_limiter.pause(e.retry_after)
+                # Retry'ить тот же send в этом же цикле бесполезно — троттл
+                # ещё активен. Этот юзер не получит ЭТО сообщение, но следующее
+                # дойдёт нормально (потеря 1 сообщения на 1 юзера, не страшно).
             except TelegramForbiddenError:
                 forbidden_user_ids.append(user_id)
                 logger.info("User %s blocked the bot, disabling delivery.", user_id)
