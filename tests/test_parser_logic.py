@@ -94,9 +94,14 @@ class TestMatchPhrase:
         # "ищу дизайнера" не матчится, если только "ищу разработчика"
         assert not _match_phrase("ищу дизайнера", "ищу разработчика для проекта")
 
-    def test_phrase_not_matched_with_word_between(self):
-        # Строгий поиск: "нужен логотип" ≠ "нужен хороший логотип" (слово между)
-        assert not _match_phrase("нужен логотип", "очень нужен хороший логотип")
+    def test_phrase_matched_with_word_between(self):
+        # _match_phrase теперь AND по токенам: оба слова присутствуют → матч.
+        # Совпадает с UI-обещанием «слова внутри строки ищутся все вместе (AND)».
+        assert _match_phrase("нужен логотип", "очень нужен хороший логотип")
+
+    def test_phrase_not_matched_when_token_missing(self):
+        # Если хоть один токен фразы не найден — нет матча.
+        assert not _match_phrase("нужен логотип", "очень хороший дизайн")
 
     def test_empty_phrase_no_match(self):
         assert not _match_phrase("", "любой текст")

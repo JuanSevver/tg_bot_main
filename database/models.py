@@ -4,7 +4,7 @@ from datetime import datetime
 from enum import Enum as PyEnum
 
 from sqlalchemy import (
-    BigInteger, Boolean, DateTime, Enum, ForeignKey,
+    BigInteger, Boolean, DateTime, Enum, ForeignKey, Index,
     Integer, String, Text, UniqueConstraint, func,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -191,7 +191,15 @@ class CategoryAccount(Base):
 class ParsedMessage(Base):
     """Deduplication table — one record per (group_id, message_id)."""
     __tablename__ = "parsed_messages"
-    __table_args__ = (UniqueConstraint("group_id", "message_id"),)
+    __table_args__ = (
+        UniqueConstraint("group_id", "message_id"),
+        # Окно дедупликации по автору+тексту — короткое (минуты), но запросы
+        # к этому индексу идут на каждое сообщение из парсера, поэтому без
+        # составного индекса по (author_id, text_hash, parsed_at) растущая
+        # таблица быстро деградирует в full table scan.
+        Index("ix_parsed_author_hash_time", "author_id", "text_hash", "parsed_at"),
+        Index("ix_parsed_parsed_at", "parsed_at"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     group_id: Mapped[int] = mapped_column(BigInteger)
@@ -199,9 +207,25 @@ class ParsedMessage(Base):
     author_id: Mapped[int | None] = mapped_column(BigInteger)
     category_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("categories.id", ondelete="SET NULL"))
     text: Mapped[str | None] = mapped_column(Text)
+    # md5(text) — индексируется вместо длинной колонки Text для быстрой
+    # дедупликации в коротком временном окне (см. _handle_message).
+    text_hash: Mapped[str | None] = mapped_column(String(32))
     author_username: Mapped[str | None] = mapped_column(String(64))
     author_link: Mapped[str | None] = mapped_column(String(256))
     parsed_at: Mapped[datetime] = mapped_column(DateTime, default=func.now())
+
+
+class ProcessedInvoice(Base):
+    """Идемпотентность для CryptoBot-поллера: фиксирует уже обработанные инвойсы.
+
+    Без неё после рестарта контейнера тот же batch оплаченных инвойсов начислил бы
+    подписку повторно — у каждого юзера срок удлинялся бы на N×days. Лечится
+    PRIMARY KEY на invoice_id и проверкой существования перед начислением.
+    """
+    __tablename__ = "processed_invoices"
+
+    invoice_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    processed_at: Mapped[datetime] = mapped_column(DateTime, default=func.now())
 
 
 class BroadcastHistory(Base):

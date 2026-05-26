@@ -103,6 +103,11 @@ def groups_list_kb(groups: list[TelegramGroup]) -> InlineKeyboardMarkup:
             callback_data="adm:grp:joinall",
             style="primary",
         ))
+        builder.row(InlineKeyboardButton(
+            text="🗺 Матрица «аккаунт × группа»",
+            callback_data="adm:grp:matrix",
+            style="primary",
+        ))
     builder.row(InlineKeyboardButton(text="◀ Назад", callback_data="adm:main", style="primary"))
     return builder.as_markup()
 
@@ -181,6 +186,11 @@ def account_detail_kb(acc_id: int, parse_joined: bool) -> InlineKeyboardMarkup:
         text=joined_label,
         callback_data=f"adm:acc:toggle_joined:{acc_id}",
         style=joined_style,
+    ))
+    builder.row(InlineKeyboardButton(
+        text="🔄 Перевыдать сессию",
+        callback_data=f"adm:acc:reissue:{acc_id}",
+        style="primary",
     ))
     builder.row(InlineKeyboardButton(
         text="🗑 Удалить аккаунт",

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 from aiogram import Router, F
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
@@ -9,9 +11,26 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from bot.keyboards import accounts_list_kb, account_detail_kb, cancel_kb
 from bot.states import AccountSG
 from database.models import ParserAccount
-from parser.manager import parser_manager
+from parser.manager import parser_manager, cancel_pending_signin
 
 router = Router(name="admin_accounts")
+logger = logging.getLogger(__name__)
+
+
+async def _update_account_session(
+    session: AsyncSession, acc_id: int, session_string: str, phone: str | None
+) -> None:
+    """Перевыдача сессии без удаления записи: сохраняет messages_parsed,
+    CategoryAccount-привязки и историю в _group_owner."""
+    acc = await session.get(ParserAccount, acc_id)
+    if not acc:
+        raise ValueError(f"Account {acc_id} not found")
+    acc.session_string = session_string
+    if phone:
+        acc.phone = phone
+    acc.is_valid = True
+    await session.commit()
+    await parser_manager.reload_clients()
 
 
 @router.callback_query(F.data == "adm:accounts")
@@ -67,7 +86,13 @@ async def process_phone(message: Message, state: FSMContext, session: AsyncSessi
             parse_mode="HTML",
         )
     except Exception as e:
-        await message.answer(f"❌ Ошибка: {e}", reply_markup=cancel_kb("adm:accounts"))
+        # При ошибке снимаем FSM, иначе следующее сообщение пойдёт как код.
+        await state.clear()
+        logger.exception("request_code failed")
+        await message.answer(
+            f"❌ Ошибка отправки кода: {type(e).__name__}",
+            reply_markup=cancel_kb("adm:accounts"),
+        )
 
 
 @router.message(AccountSG.add_code)
@@ -76,10 +101,21 @@ async def process_code(message: Message, state: FSMContext, session: AsyncSessio
     data = await state.get_data()
     phone = data["phone"]
     phone_code_hash = data.get("phone_code_hash")
+    reissue_acc_id = data.get("reissue_acc_id")
     try:
         session_string = await parser_manager.sign_in(phone, code, phone_code_hash)
-        await _save_account(session, phone, session_string)
-        await message.answer("✅ Аккаунт успешно добавлен!", reply_markup=cancel_kb("adm:accounts", "◀ К аккаунтам"))
+        if reissue_acc_id:
+            await _update_account_session(session, reissue_acc_id, session_string, phone)
+            await message.answer(
+                "✅ Сессия перевыдана. История и привязки сохранены.",
+                reply_markup=cancel_kb("adm:accounts", "◀ К аккаунтам"),
+            )
+        else:
+            await _save_account(session, phone, session_string)
+            await message.answer(
+                "✅ Аккаунт успешно добавлен!",
+                reply_markup=cancel_kb("adm:accounts", "◀ К аккаунтам"),
+            )
         await state.clear()
     except Exception as e:
         err = str(e).lower()
@@ -87,7 +123,13 @@ async def process_code(message: Message, state: FSMContext, session: AsyncSessio
             await state.set_state(AccountSG.add_2fa)
             await message.answer("🔒 Требуется пароль 2FA. Введите пароль:", reply_markup=cancel_kb("adm:accounts"))
         else:
-            await message.answer(f"❌ Ошибка: {e}", reply_markup=cancel_kb("adm:accounts"))
+            # _pending уже cleanup-нут внутри sign_in. FSM сбрасываем.
+            await state.clear()
+            logger.exception("sign_in failed")
+            await message.answer(
+                f"❌ Ошибка авторизации: {type(e).__name__}",
+                reply_markup=cancel_kb("adm:accounts"),
+            )
 
 
 @router.message(AccountSG.add_2fa)
@@ -95,13 +137,29 @@ async def process_2fa(message: Message, state: FSMContext, session: AsyncSession
     password = message.text.strip()
     data = await state.get_data()
     phone = data["phone"]
+    reissue_acc_id = data.get("reissue_acc_id")
     try:
         session_string = await parser_manager.sign_in_2fa(phone, password)
-        await _save_account(session, phone, session_string)
-        await message.answer("✅ Аккаунт добавлен с 2FA!", reply_markup=cancel_kb("adm:accounts", "◀ К аккаунтам"))
+        if reissue_acc_id:
+            await _update_account_session(session, reissue_acc_id, session_string, phone)
+            await message.answer(
+                "✅ Сессия перевыдана (2FA).",
+                reply_markup=cancel_kb("adm:accounts", "◀ К аккаунтам"),
+            )
+        else:
+            await _save_account(session, phone, session_string)
+            await message.answer(
+                "✅ Аккаунт добавлен с 2FA!",
+                reply_markup=cancel_kb("adm:accounts", "◀ К аккаунтам"),
+            )
         await state.clear()
     except Exception as e:
-        await message.answer(f"❌ Ошибка: {e}", reply_markup=cancel_kb("adm:accounts"))
+        await state.clear()
+        logger.exception("sign_in_2fa failed")
+        await message.answer(
+            f"❌ Ошибка 2FA: {type(e).__name__}",
+            reply_markup=cancel_kb("adm:accounts"),
+        )
 
 
 @router.callback_query(F.data == "adm:acc:by_session")
@@ -191,6 +249,27 @@ async def cb_acc_toggle_joined(callback: CallbackQuery, session: AsyncSession) -
         reply_markup=account_detail_kb(acc_id, acc.parse_joined_groups),
         parse_mode="HTML",
     )
+
+
+@router.callback_query(F.data.startswith("adm:acc:reissue:"))
+async def cb_acc_reissue(callback: CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
+    """Перевыдача сессии: запускаем тот же phone-flow, но в конце UPDATE
+    существующей записи вместо INSERT. messages_parsed, CategoryAccount и
+    история ParsedMessage сохраняются."""
+    acc_id = int(callback.data.split(":")[-1])
+    acc = await session.get(ParserAccount, acc_id)
+    if not acc:
+        await callback.answer("Аккаунт не найден.", show_alert=True)
+        return
+    await state.update_data(reissue_acc_id=acc_id)
+    await state.set_state(AccountSG.add_phone)
+    await callback.message.edit_text(
+        f"🔄 <b>Перевыдача сессии для acc_{acc_id}</b>\n\n"
+        f"Введите номер телефона (можно тот же — <code>{acc.phone or '—'}</code>):",
+        reply_markup=cancel_kb("adm:accounts"),
+        parse_mode="HTML",
+    )
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("adm:acc:delete:"))

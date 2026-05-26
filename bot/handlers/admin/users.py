@@ -161,6 +161,10 @@ async def process_grant_days(message: Message, state: FSMContext, session: Async
     else:
         expires = now + timedelta(days=days)
 
+    # plan="manual", purchases_count не трогаем: admin grant — это
+    # компенсация/тест/подарок, в статистике «Платных подписок» он не учитывается
+    # сознательно (см. inline-карточку: счётчик отражает только реальные оплаты
+    # через CryptoBot). Если позже юзер реально оплатит — purchases_count += 1 встанет корректно.
     if user.subscription:
         user.subscription.expires_at = expires
         user.subscription.plan = "manual"
@@ -212,14 +216,19 @@ async def process_send_msg(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     user_id = data["target_user_id"]
     try:
-        await message.bot.send_message(user_id, message.text)
+        # parse_mode="HTML" — единообразно со всеми остальными send_message
+        # в боте; иначе HTML/Markdown в сообщении админа уйдёт как plain text.
+        await message.bot.send_message(user_id, message.text or "", parse_mode="HTML")
         await message.answer(
             "✅ Сообщение отправлено.",
             reply_markup=cancel_kb(f"adm:user:{user_id}", "◀ К пользователю"),
         )
     except Exception as e:
+        # Не показываем raw stack — может содержать пути/имя БД.
+        import logging
+        logging.getLogger(__name__).exception("admin->user send failed")
         await message.answer(
-            f"❌ Ошибка: {e}",
+            f"❌ Ошибка отправки: {type(e).__name__}",
             reply_markup=cancel_kb(f"adm:user:{user_id}", "◀ К пользователю"),
         )
     await state.set_state(UserManageSG.detail)

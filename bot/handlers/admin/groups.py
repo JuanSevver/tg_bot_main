@@ -3,7 +3,7 @@ from __future__ import annotations
 from aiogram import Router, F
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
-from sqlalchemy import select, delete
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -223,11 +223,13 @@ async def process_group_link(message: Message, state: FSMContext, session: Async
     title: str | None = None
     is_channel = False
     chat_id: int | None = None
+    resolving_acc_id: int | None = None  # запомним, какой акк смог отрезолвить
+    is_public_link = False
     try:
         from parser.manager import parser_manager
         from telethon.tl.types import Channel
         from telethon.utils import get_peer_id
-        for client in parser_manager._clients:
+        for client, acc_id in parser_manager._client_pairs:
             try:
                 entity = await client.get_entity(link)
             except Exception:
@@ -238,13 +240,28 @@ async def process_group_link(message: Message, state: FSMContext, session: Async
                 chat_id = get_peer_id(entity)
             except Exception:
                 chat_id = None
+            resolving_acc_id = acc_id
             break
+        # Признак «публичной» ссылки — нет +/joinchat: с такими join() ничего
+        # не делает, и аккаунт без подписки не получит NewMessage в realtime.
+        lower = link.lower()
+        is_public_link = not (
+            "/+" in lower or "joinchat/" in lower or lower.lstrip("@").startswith("+")
+        )
     except Exception:
         pass  # Нет аккаунтов — добавим без метаданных, резолв будет в _process_group
 
     group = TelegramGroup(link=link, title=title, is_channel=is_channel, chat_id=chat_id)
     session.add(group)
     await session.commit()
+    # Прокидываем владельца сразу — иначе на первом полле round-robin
+    # ткнётся в случайный аккаунт и для приватной группы получит «не вижу».
+    if resolving_acc_id is not None and group.id:
+        try:
+            from parser.manager import parser_manager
+            parser_manager._group_owner[group.id] = resolving_acc_id
+        except Exception:
+            pass
 
     # Автоматически подписываем все парсерные аккаунты на новую группу.
     # Без этого realtime-события Telegram не присылает — он шлёт NewMessage
@@ -255,12 +272,23 @@ async def process_group_link(message: Message, state: FSMContext, session: Async
         join_result = await parser_manager.join_group(link)
         joined = sum(1 for v in join_result.values() if v in ("joined", "already"))
         total = len(join_result)
-        join_summary = f"\n👥 Аккаунтов подписано: {joined}/{total}"
-        # Если хоть кто-то не смог — покажем кратко, чтобы было видно проблему
-        failures = [f"acc_{a}: {v}" for a, v in join_result.items()
-                    if v not in ("joined", "already")]
-        if failures:
-            join_summary += "\n⚠️ " + "; ".join(failures[:3])
+        skipped_public = sum(1 for v in join_result.values() if v.startswith("skipped"))
+        if skipped_public and skipped_public == total:
+            # Публичная группа: вступление пропущено сознательно.
+            # Реалтайм для не-членов Telegram не присылает, поэтому честно
+            # предупреждаем, что задержка до 5 минут (страховочный полл).
+            join_summary = (
+                "\n⚠️ Публичная группа — аккаунты не подписаны, "
+                "новые сообщения подбираются <b>страховочным поллом раз в 5 минут</b>. "
+                "Для мгновенного realtime подпишите аккаунты на эту группу вручную "
+                "или используйте «👥 Подписать все аккаунты на все группы»."
+            )
+        else:
+            join_summary = f"\n👥 Аккаунтов подписано: {joined}/{total}"
+            failures = [f"acc_{a}: {v}" for a, v in join_result.items()
+                        if v not in ("joined", "already") and not v.startswith("skipped")]
+            if failures:
+                join_summary += "\n⚠️ " + "; ".join(failures[:3])
     except Exception as e:
         join_summary = f"\n⚠️ Авто-подписка не удалась: {e}"
 
@@ -302,7 +330,7 @@ async def cb_groups_join_all(callback: CallbackQuery, session: AsyncSession) -> 
     await callback.answer()
 
     from parser.manager import parser_manager
-    stats = {"joined": 0, "already": 0, "failed": 0}
+    stats = {"joined": 0, "already": 0, "skipped": 0, "failed": 0}
     failures: list[str] = []
 
     for grp in groups:
@@ -317,6 +345,8 @@ async def cb_groups_join_all(callback: CallbackQuery, session: AsyncSession) -> 
                 stats["joined"] += 1
             elif status == "already":
                 stats["already"] += 1
+            elif status.startswith("skipped"):
+                stats["skipped"] += 1
             else:
                 stats["failed"] += 1
                 if len(failures) < 8:
@@ -326,7 +356,9 @@ async def cb_groups_join_all(callback: CallbackQuery, session: AsyncSession) -> 
         f"✅ Готово.\n\n"
         f"Новых вступлений: <b>{stats['joined']}</b>\n"
         f"Уже состояли: <b>{stats['already']}</b>\n"
-        f"Не удалось: <b>{stats['failed']}</b>"
+        f"Пропущено (публичные): <b>{stats['skipped']}</b>\n"
+        f"Не удалось: <b>{stats['failed']}</b>\n"
+        f"<i>Публичные группы парсятся напрямую без вступления.</i>"
     )
     if failures:
         summary += "\n\n⚠️ Проблемы:\n" + "\n".join(f"• {f}" for f in failures)
@@ -339,3 +371,48 @@ async def cb_groups_join_all(callback: CallbackQuery, session: AsyncSession) -> 
         reply_markup=groups_list_kb(list(result2.scalars().all())),
         parse_mode="HTML",
     )
+
+
+@router.callback_query(F.data == "adm:grp:matrix")
+async def cb_groups_matrix(callback: CallbackQuery, session: AsyncSession) -> None:
+    """Показывает матрицу «какой аккаунт владеет какой группой».
+
+    Источник правды — parser_manager._group_owner: туда попадает acc_id того
+    аккаунта, который первым смог отрезолвить entity группы. Это сильный
+    индикатор подписки (особенно для приватных групп). Без этого экрана
+    админ не понимает, кто реально парсит каждую группу.
+    """
+    from parser.manager import parser_manager
+    from database.models import ParserAccount
+
+    grp_res = await session.execute(
+        select(TelegramGroup).where(TelegramGroup.is_active == True).order_by(TelegramGroup.added_at)
+    )
+    groups = grp_res.scalars().all()
+    acc_res = await session.execute(select(ParserAccount))
+    accs = {a.id: a for a in acc_res.scalars().all()}
+
+    if not groups:
+        await callback.answer("Нет активных групп.", show_alert=True)
+        return
+
+    lines = ["🗺 <b>Матрица аккаунт × группа</b>", ""]
+    for g in groups:
+        owner_id = parser_manager._group_owner.get(g.id)
+        if owner_id:
+            label = accs.get(owner_id).phone if accs.get(owner_id) and accs[owner_id].phone else f"acc_{owner_id}"
+            owner_str = f"✅ {label}"
+        else:
+            owner_str = "⚠️ не определён (ждёт первого полла)"
+        title = (g.title or g.link)[:35]
+        lines.append(f"• <code>{title}</code> → {owner_str}")
+
+    text = "\n".join(lines)
+    if len(text) > 3800:
+        text = text[:3800] + "\n…"
+    await callback.message.edit_text(
+        text,
+        reply_markup=groups_list_kb(list(groups)),
+        parse_mode="HTML",
+    )
+    await callback.answer()

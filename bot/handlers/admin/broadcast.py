@@ -142,7 +142,19 @@ async def cb_run_broadcast(callback: CallbackQuery, state: FSMContext, session: 
     users = (await session.execute(q)).scalars().all()
     total = len(users)
 
-    history = BroadcastHistory(target=target, message_text=data.get("bcast_text"), total=total)
+    # media_type: текстовая метка какого медиа была в рассылке (photo/video/None).
+    # Раньше не заполняли — оставалось NULL и аналитика не показывала превью.
+    media_type_value = None
+    if "photo" in data.get("content_types", set()):
+        media_type_value = "photo"
+    elif "video" in data.get("content_types", set()):
+        media_type_value = "video"
+    history = BroadcastHistory(
+        target=target,
+        message_text=data.get("bcast_text"),
+        media_type=media_type_value,
+        total=total,
+    )
     session.add(history)
     await session.commit()
 

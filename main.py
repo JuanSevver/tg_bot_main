@@ -1,5 +1,7 @@
 import asyncio
 import logging
+import os
+import signal
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
@@ -15,6 +17,8 @@ from bot.handlers.user import user_router
 from bot.handlers.admin import admin_router
 from parser.manager import parser_manager
 from services.cryptobot_polling import cryptobot_poller
+from services.scheduler import scheduler
+from services.observability import start_http_server
 from bot.commands import setup_commands
 
 logging.basicConfig(
@@ -50,7 +54,12 @@ async def main() -> None:
         return False
 
     dp.update.middleware(DatabaseMiddleware())
-    dp.update.middleware(ActivityMiddleware())
+    # ActivityMiddleware читает from_user; Update его не имеет, поэтому
+    # подключаем на конкретные observer-ы, иначе условие не сработает никогда.
+    activity = ActivityMiddleware()
+    dp.message.middleware(activity)
+    dp.callback_query.middleware(activity)
+    dp.inline_query.middleware(activity)
     dp.callback_query.middleware(AutoAnswerMiddleware())
 
     dp.include_router(admin_router)
@@ -67,16 +76,59 @@ async def main() -> None:
     cryptobot_poller.set_bot(bot)
     await cryptobot_poller.start()
 
-    try:
-        logger.info("Bot started.")
+    # Retention + subscription-expiry notifications.
+    scheduler.set_bot(bot)
+    scheduler.start()
+
+    # /healthz + /metrics на отдельном порту для Docker HEALTHCHECK.
+    http_port = int(os.getenv("OBSERVABILITY_PORT", "8080"))
+    http_runner = await start_http_server(port=http_port)
+
+    # Graceful shutdown: на SIGTERM/SIGINT останавливаем polling вежливо,
+    # чтобы дать parser_manager.stop() корректно cancel-нуть фоновые задачи.
+    stop_event = asyncio.Event()
+
+    def _signal_handler():
+        logger.info("Shutdown signal received.")
+        stop_event.set()
+
+    loop = asyncio.get_event_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, _signal_handler)
+        except NotImplementedError:
+            # Windows / non-unix — fallback на стандартный KeyboardInterrupt.
+            pass
+
+    async def _polling_runner():
         await dp.start_polling(
             bot,
             allowed_updates=dp.resolve_used_update_types(),
             drop_pending_updates=True,  # Skip stale updates accumulated while bot was offline
         )
+
+    polling_task = asyncio.create_task(_polling_runner())
+    try:
+        logger.info("Bot started.")
+        done, pending = await asyncio.wait(
+            {polling_task, asyncio.create_task(stop_event.wait())},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
     finally:
+        await dp.stop_polling()
+        if not polling_task.done():
+            polling_task.cancel()
+            try:
+                await polling_task
+            except (asyncio.CancelledError, Exception):
+                pass
         await parser_manager.stop()
         await cryptobot_poller.stop()
+        scheduler.stop()
+        try:
+            await http_runner.cleanup()
+        except Exception:
+            pass
         await bot.session.close()
 
 

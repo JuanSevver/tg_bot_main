@@ -14,6 +14,17 @@ admin_router = Router(name="admin")
 admin_router.message.filter(AdminFilter())
 admin_router.callback_query.filter(AdminFilter())
 
+
+# Заглушка для noop-кнопок (например, «⚠️ Нет аккаунтов» в категориях).
+# Без неё каждое нажатие летит в errors() как «query is too old».
+from aiogram import F
+from aiogram.types import CallbackQuery
+
+
+@admin_router.callback_query(F.data == "noop")
+async def _noop_handler(callback: CallbackQuery) -> None:
+    await callback.answer()
+
 admin_router.include_routers(
     dashboard_router,
     users_router,
@@ -24,7 +35,10 @@ admin_router.include_routers(
     categories_router,
 )
 
-# Inline router without AdminFilter (filter checked inside handler)
+# Inline-router: дополнительная защита фильтром на уровне router (defence-in-depth).
+# Проверка дублируется внутри handler — но если когда-нибудь там появится новый
+# inline-handler без проверки, фильтр router-уровня его всё равно поймает.
+inline_router.inline_query.filter(AdminFilter())
 admin_router.include_router(inline_router)
 
 __all__ = ["admin_router"]

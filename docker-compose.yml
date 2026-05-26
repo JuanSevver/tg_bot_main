@@ -4,16 +4,21 @@ services:
     restart: unless-stopped
     env_file: .env
 
-    # Переменная DATABASE_URL переопределяется здесь, чтобы БД
-    # всегда лежала в именованном volume, а не внутри контейнера.
+    # БД остаётся на хосте — bind-mount существующего файла.
+    # ВАЖНО: bot.db должен УЖЕ существовать на хосте перед `docker compose up`,
+    # иначе Docker создаст ДИРЕКТОРИЮ с этим именем и SQLite упадёт.
+    # Для первого деплоя: `touch bot.db && docker compose up -d`.
     environment:
       DATABASE_URL: sqlite+aiosqlite:////app/bot.db
+      OBSERVABILITY_PORT: "8080"
 
     volumes:
-      # SQLite-база данных (bind-mount — работает с существующим файлом)
       - ./bot.db:/app/bot.db
-      # Telethon-сессии (содержат авторизацию парсера)
-      - ./sessions:/app/sessions
+
+    # /healthz публикуем наружу — пробросьте порт если нужно мониторить извне.
+    # Внутри сети контейнера он используется HEALTHCHECK'ом из Dockerfile.
+    ports:
+      - "127.0.0.1:8080:8080"
 
     # Логи: последние 50 МБ, не больше 5 файлов
     logging:
@@ -21,6 +26,3 @@ services:
       options:
         max-size: "50m"
         max-file: "5"
-
-volumes:
-  bot_data:

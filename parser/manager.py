@@ -10,9 +10,10 @@ Responsibilities:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import itertools
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 
 from telethon import TelegramClient
@@ -22,7 +23,7 @@ from telethon.errors import (
     AuthKeyUnregisteredError, AuthKeyDuplicatedError, UserDeactivatedError,
     UserDeactivatedBanError, FloodWaitError, SessionPasswordNeededError,
 )
-from sqlalchemy import select, func
+from sqlalchemy import select, func, delete as sa_delete
 from sqlalchemy.orm import selectinload
 
 from database.db import async_session
@@ -36,6 +37,16 @@ if TYPE_CHECKING:
     from aiogram import Bot
 
 logger = logging.getLogger(__name__)
+
+# Окно дедупликации по (author_id, text_hash): сколько времени один и тот же автор
+# с тем же текстом считается «уже виден». Раньше дедуп был навсегда — биржам
+# вакансий/тендеров это ломает воспроизведение легитимных повторов.
+DEDUP_WINDOW = timedelta(minutes=1)
+
+# Сколько новых сообщений в минуту суммарно бот отправляет пользователям.
+# Telegram ограничивает 30/сек — берём запас, чтобы при параллельных _deliver
+# не словить RetryAfter. См. _GlobalSendLimiter ниже.
+GLOBAL_SEND_RATE_PER_SEC = 25
 
 def _extract_username(link: str) -> str:
     """Нормализует ссылку на группу к юзернейму (без @, в нижнем регистре).
@@ -56,31 +67,116 @@ def _extract_username(link: str) -> str:
     return link
 
 
-def _match_phrase(phrase: str, text: str) -> bool:
-    """Проверяет наличие ключевой фразы в тексте — строгий поиск подстрок.
+def _normalize_for_match(s: str) -> str:
+    """Приводит строку к виду, удобному для матчинга:
+    lower-case + переносы строк → пробелы + схлопывание whitespace.
 
-    Оба аргумента приводятся к нижнему регистру перед сравнением.
-    «дизайн» найдёт «дизайнер», «дизайна», «графическим дизайном» и т.д.
-    Многословная фраза «ищу дизайнера» найдёт только точное вхождение подстроки.
+    Без этого фраза, скопированная админом с \\n, никогда не находилась бы в
+    тексте поста, который реально написан в одну строку (и наоборот).
     """
-    phrase = phrase.strip().lower()
-    text = text.strip().lower()
+    return " ".join(s.lower().split())
+
+
+def _match_phrase(phrase: str, text: str) -> bool:
+    """AND-матч: все слова фразы должны присутствовать в тексте (как подстроки).
+
+    Соответствует обещанию админ-UI: «Слова внутри строки ищутся все вместе (AND)».
+    Однословная фраза вырождается в обычное substring-вхождение.
+    «ищу смм специалиста» найдёт «ищу хорошего смм специалиста» — между токенами
+    может быть любой текст. Это намеренно слабее, чем строгая подстрока, потому
+    что объявления редко повторяют слово-в-слово фразу из настроек категории.
+    """
+    phrase = _normalize_for_match(phrase)
+    text = _normalize_for_match(text)
     if not phrase or not text:
         return False
-    return phrase in text
+    tokens = phrase.split()
+    if len(tokens) == 1:
+        return tokens[0] in text
+    return all(tok in text for tok in tokens)
 
 
 def _has_stop_word(stop_words: list[str], text: str) -> bool:
     """Возвращает True если в тексте найдено хотя бы одно минус-слово (подстрока)."""
-    text_lower = text.lower()
+    text_norm = _normalize_for_match(text)
     for sw in stop_words:
-        sw = sw.strip().lower()
-        if sw and sw in text_lower:
+        sw = _normalize_for_match(sw)
+        if sw and sw in text_norm:
             return True
     return False
 
-# Temporary storage for pending sign-ins: {phone: (client, phone_code_hash)}
-_pending: dict[str, tuple[TelegramClient, str]] = {}
+
+def _text_hash(text: str) -> str:
+    """Короткий идентификатор текста для индексной дедупликации.
+
+    md5 достаточно — задача не криптографическая, а индексная: нам нужно
+    дёшево находить «тот же текст» по equality без полного скана колонки Text.
+    """
+    return hashlib.md5((text or "").encode("utf-8")).hexdigest()
+
+
+class _GlobalSendLimiter:
+    """Глобальный токен-бакет на исходящие send_message.
+
+    Без него при нескольких параллельных _deliver_message каждый спит 0.04с
+    отдельно, и суммарный rate легко превышает 30/сек → каскад TelegramRetryAfter.
+    Один общий лимитер сериализует выдачу токенов и держит общий потолок.
+    """
+
+    def __init__(self, rate_per_sec: int) -> None:
+        self._interval = 1.0 / rate_per_sec
+        self._lock = asyncio.Lock()
+        self._next_at = 0.0
+
+    async def acquire(self) -> None:
+        async with self._lock:
+            loop = asyncio.get_event_loop()
+            now = loop.time()
+            wait = self._next_at - now
+            if wait > 0:
+                await asyncio.sleep(wait)
+                now = loop.time()
+            self._next_at = max(now, self._next_at) + self._interval
+
+
+_send_limiter = _GlobalSendLimiter(GLOBAL_SEND_RATE_PER_SEC)
+
+# Temporary storage for pending sign-ins: {phone: (client, phone_code_hash, created_at)}.
+# TTL автоматически выкидывает протухшие записи (админ нажал Отмена/закрыл вкладку),
+# иначе они держат соединение и file-descriptors на каждую неуспешную попытку.
+_pending: dict[str, tuple[TelegramClient, str, datetime]] = {}
+_PENDING_TTL = timedelta(minutes=15)
+
+
+async def _evict_expired_pending() -> None:
+    """Освобождает зависшие sign-in клиенты по TTL."""
+    now = datetime.utcnow()
+    expired = [p for p, (_, _, ts) in _pending.items() if now - ts > _PENDING_TTL]
+    for phone in expired:
+        client, _, _ = _pending.pop(phone, (None, None, None))
+        if client is not None:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+
+
+def cancel_pending_signin(phone: str) -> None:
+    """Снимает зависший sign-in: вызывается из FSM на отмену / ошибке.
+
+    Делает best-effort disconnect, не падает если ничего не висит.
+    Возвращать корутину неудобно (вызывается из synchronous handler-context),
+    поэтому шедулим disconnect в loop.
+    """
+    record = _pending.pop(phone, None)
+    if not record:
+        return
+    client, _, _ = record
+    try:
+        loop = asyncio.get_event_loop()
+        loop.create_task(client.disconnect())
+    except Exception:
+        pass
 
 
 class ParserManager:
@@ -105,6 +201,24 @@ class ParserManager:
         # когда у новых приватных групп резолвится chat_id.
         self._explicit_chat_ids: set[int] = set()
         self._explicit_usernames: set[str] = set()
+        # Связь канал-обсуждение: chat_id канала → chat_id discussion-группы.
+        # Комментарии к постам канала прилетают в discussion-группу как обычные
+        # NewMessage, и фильтр должен пропускать её chat_id, иначе аккаунт,
+        # не подписанный на discussion, не получит realtime по комментариям.
+        self._channel_to_discussion: dict[int, int] = {}
+        # Lock на reload + сбор сообщений — иначе reload_clients() во время
+        # активного _collect_messages даёт RuntimeError на итераторе и/или
+        # дёргает методы на уже дисконнектнутом клиенте.
+        self._reload_lock = asyncio.Lock()
+        # Polling background task — храним чтобы корректно отменить в stop().
+        # Без этого SIGTERM оставляет «Task was destroyed but it is pending».
+        self._polling_task: asyncio.Task | None = None
+        # Background task периодической попытки переподнять «invalid» аккаунты
+        # без ручного вмешательства админа (бан мог быть временным).
+        self._retry_task: asyncio.Task | None = None
+        # Алерт админам делается один раз на инвалидацию каждого acc_id —
+        # без этого при каждом reload_clients шлём дубль.
+        self._alerted_invalid: set[int] = set()
 
     @property
     def _clients(self) -> list[TelegramClient]:
@@ -117,85 +231,157 @@ class ParserManager:
     async def start(self) -> None:
         await self.reload_clients()
         self._running = True
-        asyncio.create_task(self._polling_loop())
+        self._polling_task = asyncio.create_task(self._polling_loop())
+        self._retry_task = asyncio.create_task(self._invalid_retry_loop())
 
     async def stop(self) -> None:
         self._running = False
+        for task in (self._polling_task, self._retry_task):
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
         for client in self._clients:
             try:
                 await client.disconnect()
             except Exception:
                 pass
 
-    async def reload_clients(self) -> None:
-        # Снимаем realtime-обработчики перед дисконнектом
-        for client, _ in self._client_pairs:
-            self._remove_rt_handlers(client)
+    async def _invalidate_account(self, acc_id: int, reason: str) -> None:
+        """Помечает аккаунт is_valid=False и единожды алертит админам."""
+        async with async_session() as db:
+            r = await db.execute(select(ParserAccount).where(ParserAccount.id == acc_id))
+            a = r.scalar_one_or_none()
+            if a:
+                a.is_valid = False
+                await db.commit()
+        logger.warning("Account %s marked invalid (%s).", acc_id, reason)
+        if acc_id in self._alerted_invalid:
+            return
+        self._alerted_invalid.add(acc_id)
+        await self._notify_admins(
+            f"⚠️ <b>Парсерный аккаунт acc_{acc_id} отвалился</b>\n"
+            f"Причина: <code>{reason}</code>\n\n"
+            f"Перевыдайте сессию через панель администратора → «Аккаунты»."
+        )
 
-        for c, _ in self._client_pairs:
-            try:
-                await c.disconnect()
-            except Exception:
-                pass
-        self._client_pairs.clear()
-        self._joined_pairs.clear()
-        self._group_owner.clear()
+    async def _notify_admins(self, text: str) -> None:
+        """Шлёт alert всем admin_ids. Используется при инвалидации аккаунтов
+        и других чрезвычайных событиях, чтобы прод не «тихо умирал»."""
+        if not self._bot:
+            return
+        try:
+            from config import load_config
+            cfg = load_config()
+            for admin_id in cfg.admin_ids:
+                try:
+                    await self._bot.send_message(admin_id, text, parse_mode="HTML")
+                except Exception as e:
+                    logger.debug("Cannot notify admin %s: %s", admin_id, e)
+        except Exception as e:
+            logger.error("Admin alert failed: %s", e)
 
-        async with async_session() as session:
-            result = await session.execute(
-                select(ParserAccount)
-                .where(ParserAccount.is_active == True, ParserAccount.is_valid == True)
-                .options(selectinload(ParserAccount.proxy))
+    def _install_disconnect_hook(self, client: TelegramClient, acc_id: int) -> None:
+        """Подписывается на disconnect клиента, чтобы поймать фоновый
+        AuthKeyDuplicated (Telethon роняет его из recv-loop, не из connect())
+        и убрать мёртвый клиент из пула, иначе round-robin будет дёргать его."""
+
+        loop = asyncio.get_event_loop()
+
+        def _on_disconnect(_client):
+            # Запускаем cleanup в loop — disconnect-хук может вызваться из любого треда.
+            asyncio.run_coroutine_threadsafe(
+                self._handle_client_disconnect(client, acc_id), loop
             )
-            accounts = result.scalars().all()
 
-        for acc in accounts:
-            if not acc.session_string:
-                continue
-            proxy = None
-            if acc.proxy and acc.proxy.is_active:
-                proxy = proxy_tuple(
-                    acc.proxy.host, acc.proxy.port, acc.proxy.type,
-                    acc.proxy.username, acc.proxy.password,
-                )
-            try:
-                client = make_client(acc.session_string, proxy)
-                await client.connect()
-                if not await client.is_user_authorized():
-                    raise AuthKeyUnregisteredError(request=None)
-                self._client_pairs.append((client, acc.id))
-                if acc.parse_joined_groups:
-                    self._joined_pairs.append((client, acc.id))
-                logger.info("Parser client account_%s started (joined=%s).", acc.id, acc.parse_joined_groups)
-            except (
-                AuthKeyUnregisteredError, AuthKeyDuplicatedError,
-                UserDeactivatedError, UserDeactivatedBanError,
-            ) as e:
-                async with async_session() as db:
-                    r = await db.execute(select(ParserAccount).where(ParserAccount.id == acc.id))
-                    a = r.scalar_one_or_none()
-                    if a:
-                        a.is_valid = False
-                        await db.commit()
-                logger.warning(
-                    "Account %s marked invalid (%s). Re-authorize via admin panel.",
-                    acc.id, type(e).__name__,
-                )
-                try:
-                    await client.disconnect()
-                except Exception:
-                    pass
-            except Exception as e:
-                logger.error("Failed to start client for account %s: %s", acc.id, e)
-                try:
-                    await client.disconnect()
-                except Exception:
-                    pass
+        try:
+            client.on(_on_disconnect)  # type: ignore[attr-defined]
+        except Exception:
+            # Не все версии Telethon экспортируют on(); fallback тихий.
+            pass
 
+    async def _handle_client_disconnect(self, client: TelegramClient, acc_id: int) -> None:
+        """Удаляет мёртвого клиента из пулов. Вызывается из disconnect-хука."""
+        try:
+            authorized = await asyncio.wait_for(client.is_user_authorized(), timeout=3)
+        except Exception:
+            authorized = False
+        if authorized:
+            return  # дисконнект был временный, Telethon переподключится сам
+        self._client_pairs = [p for p in self._client_pairs if p[0] is not client]
+        self._joined_pairs = [p for p in self._joined_pairs if p[0] is not client]
         self._cycle = itertools.cycle(self._client_pairs) if self._client_pairs else itertools.cycle([])
+        await self._invalidate_account(acc_id, "AuthKey/disconnect")
 
-        # Регистрируем realtime-обработчики после того как клиенты подключены
-        await self._register_realtime_handlers()
+    async def reload_clients(self) -> None:
+        # Lock защищает от race condition с _collect_messages, где идёт
+        # итерация self._client_pairs — без него dict/list changed during iteration.
+        async with self._reload_lock:
+            # Снимаем realtime-обработчики перед дисконнектом
+            for client, _ in self._client_pairs:
+                self._remove_rt_handlers(client)
+
+            for c, _ in self._client_pairs:
+                try:
+                    await c.disconnect()
+                except Exception:
+                    pass
+            self._client_pairs.clear()
+            self._joined_pairs.clear()
+            self._group_owner.clear()
+
+            async with async_session() as session:
+                result = await session.execute(
+                    select(ParserAccount)
+                    .where(ParserAccount.is_active == True, ParserAccount.is_valid == True)
+                    .options(selectinload(ParserAccount.proxy))
+                )
+                accounts = result.scalars().all()
+
+            for acc in accounts:
+                if not acc.session_string:
+                    continue
+                proxy = None
+                if acc.proxy and acc.proxy.is_active:
+                    proxy = proxy_tuple(
+                        acc.proxy.host, acc.proxy.port, acc.proxy.type,
+                        acc.proxy.username, acc.proxy.password,
+                    )
+                client = make_client(acc.session_string, proxy)
+                try:
+                    await client.connect()
+                    if not await client.is_user_authorized():
+                        raise AuthKeyUnregisteredError(request=None)
+                    self._client_pairs.append((client, acc.id))
+                    if acc.parse_joined_groups:
+                        self._joined_pairs.append((client, acc.id))
+                    self._install_disconnect_hook(client, acc.id)
+                    # Если аккаунт раньше алертили — это успешный re-auth,
+                    # сбрасываем флаг, чтобы будущая инвалидация снова уведомила.
+                    self._alerted_invalid.discard(acc.id)
+                    logger.info("Parser client account_%s started (joined=%s).", acc.id, acc.parse_joined_groups)
+                except (
+                    AuthKeyUnregisteredError, AuthKeyDuplicatedError,
+                    UserDeactivatedError, UserDeactivatedBanError,
+                ) as e:
+                    await self._invalidate_account(acc.id, type(e).__name__)
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
+                except Exception as e:
+                    logger.error("Failed to start client for account %s: %s", acc.id, e)
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
+
+            self._cycle = itertools.cycle(self._client_pairs) if self._client_pairs else itertools.cycle([])
+
+            # Регистрируем realtime-обработчики после того как клиенты подключены
+            await self._register_realtime_handlers()
 
     # ------------------------------------------------------------------
     # Real-time event handlers (Telethon NewMessage)
@@ -333,25 +519,37 @@ class ParserManager:
     # ------------------------------------------------------------------
 
     async def request_code(self, phone: str) -> str:
+        await _evict_expired_pending()
         from config import load_config
         cfg = load_config()
         client = TelegramClient(StringSession(), cfg.tg_api_id, cfg.tg_api_hash)
         await client.connect()
         result = await client.send_code_request(phone)
-        _pending[phone] = (client, result.phone_code_hash)
+        _pending[phone] = (client, result.phone_code_hash, datetime.utcnow())
         return result.phone_code_hash
 
     async def sign_in(self, phone: str, code: str, phone_code_hash: str) -> str:
-        client, _ = _pending[phone]
-        await client.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash)
+        client, _, _ = _pending[phone]
+        try:
+            await client.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash)
+        except SessionPasswordNeededError:
+            # Клиент остаётся в _pending для последующего sign_in_2fa.
+            raise
+        except Exception:
+            cancel_pending_signin(phone)
+            raise
         ss = client.session.save()
         await client.disconnect()
         _pending.pop(phone, None)
         return ss
 
     async def sign_in_2fa(self, phone: str, password: str) -> str:
-        client, _ = _pending[phone]
-        await client.sign_in(password=password)
+        client, _, _ = _pending[phone]
+        try:
+            await client.sign_in(password=password)
+        except Exception:
+            cancel_pending_signin(phone)
+            raise
         ss = client.session.save()
         await client.disconnect()
         _pending.pop(phone, None)
@@ -362,17 +560,16 @@ class ParserManager:
     # ------------------------------------------------------------------
 
     async def join_group(self, link_or_chat_id) -> dict:
-        """Подписывает все парсерные аккаунты на группу/канал по ссылке.
+        """Подписывает все парсерные аккаунты на ПРИВАТНУЮ группу по инвайт-ссылке.
+
+        Публичные группы (`@x`, `t.me/x`) пропускаются — для них вступление не
+        требуется: парсер читает историю через get_entity+iter_messages у любого
+        аккаунта. Лимит ~500 каналов/аккаунт ценный, тратим его только на
+        приватные группы, где realtime без членства не работает.
 
         Возвращает словарь {acc_id: status}, где status — одна из строк:
-        "joined", "already", "error: <текст>".
-
-        Поддерживает:
-        - публичные username/ссылки (`@x`, `t.me/x`, `https://t.me/x`)
-        - приватные инвайт-ссылки (`t.me/+abc`, `t.me/joinchat/abc`)
-        - числовой chat_id (если бот уже резолвил группу)
+        "joined", "already", "skipped: public", "error: <текст>".
         """
-        from telethon.tl.functions.channels import JoinChannelRequest
         from telethon.tl.functions.messages import ImportChatInviteRequest
         from telethon.errors import (
             UserAlreadyParticipantError, InviteHashExpiredError,
@@ -393,35 +590,26 @@ class ParserManager:
                     invite_hash = tail[len("joinchat/"):].split("?")[0].split("/")[0]
                 break
 
+        if not invite_hash:
+            # Публичная группа — парсим напрямую, вступать не нужно.
+            for _, acc_id in self._client_pairs:
+                result[acc_id] = "skipped: public"
+            return result
+
         for client, acc_id in self._client_pairs:
             try:
-                if invite_hash:
-                    try:
-                        await client(ImportChatInviteRequest(invite_hash))
-                        result[acc_id] = "joined"
-                    except UserAlreadyParticipantError:
-                        result[acc_id] = "already"
-                else:
-                    # публичная группа/канал или числовой id
-                    target = link_or_chat_id
-                    if isinstance(target, str):
-                        # обрезаем префиксы и @ — Telethon принимает чистый username
-                        t = target
-                        for prefix in ("https://t.me/", "http://t.me/", "t.me/"):
-                            if t.startswith(prefix):
-                                t = t[len(prefix):]
-                                break
-                        t = t.lstrip("@").split("/")[0].split("?")[0]
-                        target = t
-                    try:
-                        await client(JoinChannelRequest(target))
-                        result[acc_id] = "joined"
-                    except UserAlreadyParticipantError:
-                        result[acc_id] = "already"
+                try:
+                    await client(ImportChatInviteRequest(invite_hash))
+                    result[acc_id] = "joined"
+                except UserAlreadyParticipantError:
+                    result[acc_id] = "already"
             except FloodWaitError as e:
                 result[acc_id] = f"floodwait {e.seconds}s"
                 logger.warning("FloodWait %s sec joining %s acc=%s", e.seconds, link, acc_id)
-                await asyncio.sleep(min(e.seconds, 10))
+                # Раньше было min(e.seconds, 10) — Telegram считает, что вы должны
+                # выждать ПОЛНУЮ задержку, иначе на следующем запросе flood удваивается
+                # вплоть до временного бана. Капать НЕЛЬЗЯ.
+                await asyncio.sleep(e.seconds)
             except (InviteHashExpiredError, InviteHashInvalidError) as e:
                 result[acc_id] = f"bad invite: {type(e).__name__}"
             except ChannelsTooMuchError:
@@ -451,6 +639,10 @@ class ParserManager:
         поэтому повторно регистрировать обработчики не нужно: меняем содержимое
         наборов in-place, и фильтр сразу видит новые chat_id (например, после
         первого полла, когда у приватных групп резолвится peer id).
+
+        Discussion-группы каналов (см. self._channel_to_discussion) тоже добавляются —
+        иначе realtime-комментарии не доходят: они приходят как NewMessage с
+        chat_id = id группы обсуждения, а не канала.
         """
         async with async_session() as session:
             grp_result = await session.execute(
@@ -468,6 +660,7 @@ class ParserManager:
         # in-place — чтобы хендлеры, держащие ссылку, увидели изменения
         self._explicit_chat_ids.clear()
         self._explicit_chat_ids.update(new_chat_ids)
+        self._explicit_chat_ids.update(self._channel_to_discussion.values())
         self._explicit_usernames.clear()
         self._explicit_usernames.update(new_usernames)
 
@@ -490,8 +683,45 @@ class ParserManager:
                 logger.error("Catchup polling error: %s", e)
             await asyncio.sleep(300)  # 5 минут
 
+    async def _invalid_retry_loop(self) -> None:
+        """Раз в час пытается переподнять аккаунты, помеченные is_valid=False.
+
+        Бан Telegram бывает временным; без авто-retry парсинг тихо умирает
+        и админ узнаёт об этом только по жалобам пользователей.
+        """
+        await asyncio.sleep(3600)
+        while self._running:
+            try:
+                async with async_session() as db:
+                    res = await db.execute(
+                        select(ParserAccount).where(
+                            ParserAccount.is_active == True,
+                            ParserAccount.is_valid == False,
+                        )
+                    )
+                    invalid = res.scalars().all()
+                if invalid:
+                    logger.info("Retry %d invalid accounts...", len(invalid))
+                    # Поднимаем их обратно: ставим is_valid=True и зовём reload_clients.
+                    # Те, что реально мертвы, пометятся обратно в _invalidate_account.
+                    async with async_session() as db:
+                        for acc in invalid:
+                            a = await db.get(ParserAccount, acc.id)
+                            if a:
+                                a.is_valid = True
+                        await db.commit()
+                    await self.reload_clients()
+            except Exception as e:
+                logger.error("Invalid retry loop error: %s", e)
+            await asyncio.sleep(3600)
+
     async def _collect_messages(self) -> None:
-        if not self._client_pairs:
+        # Снапшот self._client_pairs — на случай если reload_clients произойдёт
+        # параллельно: lock в reload_clients частично защищает, но дополнительная
+        # копия гарантирует стабильный итератор.
+        client_pairs_snapshot = list(self._client_pairs)
+        joined_pairs_snapshot = list(self._joined_pairs)
+        if not client_pairs_snapshot:
             return
 
         async with async_session() as session:
@@ -538,11 +768,11 @@ class ParserManager:
 
             ordered: list[tuple[TelegramClient, int]] = []
             if owner_acc_id is not None:
-                for pair in self._client_pairs:
+                for pair in client_pairs_snapshot:
                     if pair[1] == owner_acc_id:
                         ordered.append(pair)
                         break
-            for pair in self._client_pairs:
+            for pair in client_pairs_snapshot:
                 if pair not in ordered:
                     ordered.append(pair)
 
@@ -563,7 +793,7 @@ class ParserManager:
                 logger.warning("Group %s: no account could access it", group.link)
 
         # 2. Группы в которых состоят аккаунты с parse_joined_groups=True
-        for client, acc_id in self._joined_pairs:
+        for client, acc_id in joined_pairs_snapshot:
             try:
                 await self._process_joined_groups(
                     client, acc_id, categories, cat_acc_map,
@@ -624,6 +854,23 @@ class ParserManager:
                     group.chat_id = resolved_chat_id
                     group.is_channel = actually_channel
 
+                # Запоминаем связь канал → discussion-группа, чтобы realtime-фильтр
+                # пропускал комментарии (они приходят в discussion как обычный NewMessage).
+                # У discussion-группы свой chat_id, отличный от канала, и без этой
+                # привязки фильтр их режет → realtime для комментариев не работает.
+                discussion_chat_id: int | None = None
+                linked_id = getattr(entity, "linked_chat_id", None)
+                if actually_channel and linked_id:
+                    try:
+                        linked_entity = await client.get_entity(linked_id)
+                        discussion_chat_id = get_peer_id(linked_entity)
+                        if discussion_chat_id and discussion_chat_id != self._channel_to_discussion.get(resolved_chat_id):
+                            self._channel_to_discussion[resolved_chat_id] = discussion_chat_id
+                            # Чтобы realtime сразу подхватил discussion-id
+                            self._explicit_chat_ids.add(discussion_chat_id)
+                    except Exception:
+                        pass
+
                 # last_seen_id ищем по тому же peer id, что хранится в ParsedMessage
                 last_seen_id = await self._get_last_seen_message_id(session, resolved_chat_id)
 
@@ -642,15 +889,25 @@ class ParserManager:
                         continue
                     await self._handle_message(session, message, categories, acc_id, cat_acc_map)
 
-                # Если это канал — дополнительно парсим комментарии к постам
+                # Если это канал — дополнительно парсим комментарии к постам.
+                # last_seen для комментариев ведём по chat_id discussion-группы
+                # (message.chat_id комментариев = discussion id), иначе каждый
+                # цикл прогоняли бы те же 30 комментариев × 20 постов вхолостую.
                 if group.is_channel:
+                    comments_last_seen = 0
+                    if discussion_chat_id:
+                        comments_last_seen = await self._get_last_seen_message_id(
+                            session, discussion_chat_id
+                        )
                     async for post in client.iter_messages(entity, limit=20):
                         if not (post.replies and post.replies.replies):
                             continue
                         try:
-                            async for comment in client.iter_messages(
-                                entity, reply_to=post.id, limit=30
-                            ):
+                            comment_kwargs = {"reply_to": post.id, "limit": 30}
+                            if comments_last_seen > 0:
+                                comment_kwargs["min_id"] = comments_last_seen
+                                comment_kwargs.pop("limit", None)
+                            async for comment in client.iter_messages(entity, **comment_kwargs):
                                 if not comment.text:
                                     continue
                                 await self._handle_message(session, comment, categories, acc_id, cat_acc_map)
@@ -759,10 +1016,11 @@ class ParserManager:
     ) -> None:
         text = message.text or ""
         text_lower = text.lower()
+        text_h = _text_hash(text)
 
         # 1. Дедупликация по (group_id, message_id) — одно и то же сообщение не обрабатываем дважды
         check = await session.execute(
-            select(ParsedMessage).where(
+            select(ParsedMessage.id).where(
                 ParsedMessage.group_id == message.chat_id,
                 ParsedMessage.message_id == message.id,
             )
@@ -779,12 +1037,17 @@ class ParserManager:
                 sender = None
         author_id = getattr(sender, "id", None)
 
-        # 3. Дедупликация по автору: если тот же автор уже присылал идентичный текст — пропускаем
+        # 3. Дедупликация по автору в коротком окне (DEDUP_WINDOW).
+        # Раньше дедуп был навсегда + по колонке Text без индекса → full table scan
+        # и потеря легитимных повторов от того же автора. Теперь равенство по
+        # text_hash (md5) с composite-index'ом и WHERE parsed_at > NOW()-window.
         if author_id and text:
+            window_start = datetime.utcnow() - DEDUP_WINDOW
             author_dup = await session.execute(
-                select(ParsedMessage).where(
+                select(ParsedMessage.id).where(
                     ParsedMessage.author_id == author_id,
-                    ParsedMessage.text == text,
+                    ParsedMessage.text_hash == text_h,
+                    ParsedMessage.parsed_at > window_start,
                 ).limit(1)
             )
             if author_dup.scalar_one_or_none():
@@ -826,6 +1089,7 @@ class ParserManager:
             author_id=author_id,
             category_id=matched_cat.id,
             text=message.text,
+            text_hash=text_h,
             author_username=author_username,
             author_link=author_link,
         )
@@ -866,8 +1130,21 @@ class ParserManager:
             )
             kb = message_action_kb(pm.author_username, pm.author_link)
 
+            now = datetime.utcnow()
             for user in users:
+                # Доставка пачки занимает время — у юзера в её процессе могла
+                # истечь подписка. Повторная проверка дешевле, чем доставить
+                # «лишнее» сообщение после истечения.
+                sub_check = await session.execute(
+                    select(Subscription.expires_at).where(Subscription.user_id == user.id)
+                )
+                exp = sub_check.scalar_one_or_none()
+                if not exp or exp <= now:
+                    continue
                 try:
+                    # Глобальный токен-бакет вместо локального sleep(0.04) —
+                    # 5 параллельных _deliver_message больше не дают суммарно 125/сек.
+                    await _send_limiter.acquire()
                     await self._bot.send_message(
                         user.id, text, reply_markup=kb, parse_mode="HTML",
                     )
@@ -877,6 +1154,7 @@ class ParserManager:
                     logger.warning("RetryAfter %s sec, pausing delivery.", e.retry_after)
                     await asyncio.sleep(e.retry_after)
                     try:
+                        await _send_limiter.acquire()
                         await self._bot.send_message(
                             user.id, text, reply_markup=kb, parse_mode="HTML",
                         )
@@ -889,9 +1167,6 @@ class ParserManager:
                     logger.info("User %s blocked the bot, disabling delivery.", user.id)
                 except Exception as e:
                     logger.debug("Deliver to user %s failed: %s", user.id, e)
-
-                # Throttle: не более 25 сообщений/сек (лимит Telegram — 30/сек)
-                await asyncio.sleep(0.04)
 
             await session.commit()
 

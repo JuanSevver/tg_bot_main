@@ -56,28 +56,43 @@ def _parse_proxy_input(text: str) -> tuple[str, str, int, str | None, str | None
       host:port:user:pass
       [type] host:port:user:pass
       type host port [user] [pass]
+
+    type, если не указан явно, == "socks5". Чтобы пробовать оба варианта
+    (HTTP vs SOCKS5) можно использовать опцию авто-определения в кнопке
+    «Проверить» — там идёт live-проверка.
+
+    Старый код использовал `not parts[1].isdigit() is False`, что из-за
+    приоритета операторов работало «случайно правильно». Переписано на
+    явные условия без двойных отрицаний.
     """
     text = text.strip()
+    if not text:
+        return None
     ptype = "socks5"
 
-    # Определяем тип если он указан первым словом без двоеточия
+    # Определяем тип, если он указан первым словом без двоеточия
     parts = text.split()
-    if parts[0].lower() in ("socks5", "http") and len(parts) > 1:
+    if parts and parts[0].lower() in ("socks5", "http", "socks4") and len(parts) > 1:
         ptype = parts[0].lower()
         text = " ".join(parts[1:])
         parts = parts[1:]
 
     # Формат через пробелы: host port [user] [pass]
-    if len(parts) >= 2 and not parts[1].isdigit() is False or (len(parts) >= 2 and ":" not in parts[0]):
-        if len(parts) >= 2:
-            try:
-                host = parts[0]
-                port = int(parts[1])
-                username = parts[2] if len(parts) > 2 else None
-                password = parts[3] if len(parts) > 3 else None
-                return ptype, host, port, username, password
-            except (ValueError, IndexError):
-                pass
+    # Условие: ровно один разделитель — пробел (т.е. в parts[0] нет ":")
+    # и parts[1] — это число (порт).
+    if (
+        len(parts) >= 2
+        and ":" not in parts[0]
+        and parts[1].isdigit()
+    ):
+        try:
+            host = parts[0]
+            port = int(parts[1])
+            username = parts[2] if len(parts) > 2 else None
+            password = parts[3] if len(parts) > 3 else None
+            return ptype, host, port, username, password
+        except (ValueError, IndexError):
+            pass
 
     # Формат через двоеточие: host:port[:user:pass]
     colon_parts = text.split(":")
@@ -91,6 +106,35 @@ def _parse_proxy_input(text: str) -> tuple[str, str, int, str | None, str | None
         except (ValueError, IndexError):
             pass
 
+    return None
+
+
+async def _auto_detect_proxy_type(host: str, port: int, username: str | None, password: str | None) -> str | None:
+    """Пробует SOCKS5 и HTTP по очереди — возвращает тот, что работает.
+
+    Без этого админ, который ввёл «host:port:user:pass» от HTTP-прокси, молча
+    сохраняет его как socks5 и потом удивляется почему ничего не работает.
+    """
+    for candidate in ("socks5", "http"):
+        proxy_url = f"{candidate}://"
+        if username:
+            proxy_url += f"{username}:{password}@"
+        proxy_url += f"{host}:{port}"
+        timeout = aiohttp.ClientTimeout(total=8)
+        try:
+            if candidate == "socks5":
+                connector = ProxyConnector.from_url(proxy_url)
+                async with aiohttp.ClientSession(connector=connector, timeout=timeout) as s:
+                    async with s.get("https://api.ipify.org") as resp:
+                        if resp.status == 200:
+                            return candidate
+            else:
+                async with aiohttp.ClientSession(timeout=timeout) as s:
+                    async with s.get("https://api.ipify.org", proxy=proxy_url) as resp:
+                        if resp.status == 200:
+                            return candidate
+        except Exception:
+            continue
     return None
 
 
@@ -109,6 +153,14 @@ async def process_proxy_add(message: Message, state: FSMContext, session: AsyncS
         return
 
     ptype, host, port, username, password = parsed
+    # Если тип не был указан явно (по дефолту socks5), пробуем оба —
+    # ввод от админа часто без префикса, а http-прокси не работает как socks5.
+    text_lower = (message.text or "").strip().lower()
+    type_was_explicit = text_lower.startswith(("socks5", "http", "socks4"))
+    if not type_was_explicit:
+        detected = await _auto_detect_proxy_type(host, port, username, password)
+        if detected:
+            ptype = detected
     try:
         proxy = Proxy(host=host, port=port, type=ptype, username=username, password=password)
         session.add(proxy)
@@ -124,7 +176,12 @@ async def process_proxy_add(message: Message, state: FSMContext, session: AsyncS
             parse_mode="HTML",
         )
     except Exception as e:
-        await message.answer(f"❌ Ошибка: {e}", reply_markup=cancel_kb("adm:proxies"))
+        import logging
+        logging.getLogger(__name__).exception("proxy add failed")
+        await message.answer(
+            f"❌ Не удалось добавить прокси ({type(e).__name__}).",
+            reply_markup=cancel_kb("adm:proxies"),
+        )
     await state.set_state(ProxySG.list)
 
 

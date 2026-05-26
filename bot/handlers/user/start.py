@@ -28,6 +28,25 @@ WELCOME_TEXT = (
     "Приятного использования!"
 )
 
+MAIN_MENU_TEXT = (
+    "🏠 <b>Главное меню</b>\n"
+    "━━━━━━━━━━━━━━━━━━━━━\n\n"
+    + WELCOME_TEXT
+)
+
+INSTRUCTION_TEXT = (
+    "📋 <b>Инструкция</b>\n"
+    "━━━━━━━━━━━━━━━━━━━━━\n\n"
+    "1️⃣  Нажмите <b>«Получать запросы»</b> — лента включится.\n\n"
+    "2️⃣  Зайдите в <b>«Категории»</b> и выберите нужные тематики.\n"
+    "     Остальные можно отключить — лишнего не придёт.\n\n"
+    "3️⃣  Заявки будут приходить <b>прямо сюда</b>, без дублей.\n\n"
+    "4️⃣  Под каждым сообщением кнопка\n"
+    "     <b>«Написать пользователю»</b> — один тап и вы в диалоге.\n\n"
+    "━━━━━━━━━━━━━━━━━━━━━\n"
+    "💡 Подписку можно продлить в разделе <b>«Купить подписку»</b>."
+)
+
 CAPTCHA_TEXT = (
     "🤖 <b>Проверка</b>\n"
     "━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -41,6 +60,29 @@ CAPTCHA_TEXT = (
 def _generate_captcha() -> tuple[str, int]:
     a, b = random.randint(1, 10), random.randint(1, 10)
     return f"{a} + {b}", a + b
+
+
+# Простой in-memory rate-limit для капчи. Защищает от ботов, которые
+# перебирают 100 возможных пар (1+1...10+10) до победы. После N неудач
+# юзер блокируется на window. Хранение in-memory приемлемо: при рестарте
+# атакующий потеряет состояние, но и пройти задачу всё равно ещё не сможет.
+_captcha_attempts: dict[int, list[datetime]] = {}
+_CAPTCHA_MAX_ATTEMPTS = 3
+_CAPTCHA_WINDOW = timedelta(minutes=5)
+
+
+def _captcha_check_rate(user_id: int) -> bool:
+    """True если попытка разрешена. Записывает неудачу при возврате False."""
+    now = datetime.utcnow()
+    attempts = _captcha_attempts.get(user_id, [])
+    # Чистим устаревшие
+    attempts = [t for t in attempts if now - t < _CAPTCHA_WINDOW]
+    _captcha_attempts[user_id] = attempts
+    return len(attempts) < _CAPTCHA_MAX_ATTEMPTS
+
+
+def _captcha_register_fail(user_id: int) -> None:
+    _captcha_attempts.setdefault(user_id, []).append(datetime.utcnow())
 
 
 async def _get_or_create_user(session: AsyncSession, tg_user) -> User:
@@ -63,20 +105,11 @@ async def _get_or_create_user(session: AsyncSession, tg_user) -> User:
 
 
 async def _send_main_menu(message: Message | CallbackQuery, user: User) -> None:
-    text = (
-        "🏠 <b>Главное меню</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "Добро пожаловать!\n\n"
-        "Рад приветствовать вас в боте!\n\n"
-        "📍 Вся необходимая информация находится в разделах «Поддержка» или «Инструкция».\n\n"
-        "Также вы можете зайти в «Категории» и выбрать интересующие вас темы.\n\n"
-        "Приятного использования!"
-    )
     kb = main_menu_kb(user.receiving_enabled)
     if isinstance(message, Message):
-        await message.answer(text, reply_markup=kb, parse_mode="HTML")
+        await message.answer(MAIN_MENU_TEXT, reply_markup=kb, parse_mode="HTML")
     else:
-        await message.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+        await message.message.edit_text(MAIN_MENU_TEXT, reply_markup=kb, parse_mode="HTML")
 
 
 @router.message(CommandStart())
@@ -107,13 +140,22 @@ async def process_captcha(message: Message, state: FSMContext, session: AsyncSes
     correct: int = data.get("captcha_answer", -1)
     user_id: int = data.get("user_id")
 
+    if not _captcha_check_rate(message.from_user.id):
+        # Бот перебирает 100 возможных пар → лимит сводит брут к 36 попыток/час.
+        await message.answer(
+            "⏳ Слишком много попыток. Подождите 5 минут и попробуйте снова."
+        )
+        return
+
     try:
         given = int(message.text.strip())
     except (ValueError, AttributeError):
+        _captcha_register_fail(message.from_user.id)
         await message.answer("❌ Введите число — ответ на пример.")
         return
 
     if given != correct:
+        _captcha_register_fail(message.from_user.id)
         expr, answer = _generate_captcha()
         await state.update_data(captcha_answer=answer)
         await message.answer(
@@ -165,19 +207,7 @@ async def process_captcha(message: Message, state: FSMContext, session: AsyncSes
 @router.message(Command("help"))
 async def cmd_help(message: Message) -> None:
     from bot.keyboards import instruction_kb
-    text = (
-        "📋 <b>Инструкция</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "1️⃣  Нажмите <b>«Получать запросы»</b> — лента включится.\n\n"
-        "2️⃣  Зайдите в <b>«Категории»</b> и выберите нужные тематики.\n"
-        "     Остальные можно отключить — лишнего не придёт.\n\n"
-        "3️⃣  Заявки будут приходить <b>прямо сюда</b>, без дублей.\n\n"
-        "4️⃣  Под каждым сообщением кнопка\n"
-        "     <b>«Написать пользователю»</b> — один тап и вы в диалоге.\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        "💡 Подписку можно продлить в разделе <b>«Купить подписку»</b>."
-    )
-    await message.answer(text, reply_markup=instruction_kb(), parse_mode="HTML")
+    await message.answer(INSTRUCTION_TEXT, reply_markup=instruction_kb(), parse_mode="HTML")
 
 
 @router.message(Command("profile"))
@@ -293,17 +323,5 @@ async def cb_toggle_receive(callback: CallbackQuery, session: AsyncSession) -> N
 @router.callback_query(F.data == "instruction")
 async def cb_instruction(callback: CallbackQuery) -> None:
     from bot.keyboards import instruction_kb
-    text = (
-        "📋 <b>Инструкция</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "1️⃣  Нажмите <b>«Получать запросы»</b> — лента включится.\n\n"
-        "2️⃣  Зайдите в <b>«Категории»</b> и выберите нужные тематики.\n"
-        "     Остальные можно отключить — лишнего не придёт.\n\n"
-        "3️⃣  Заявки будут приходить <b>прямо сюда</b>, без дублей.\n\n"
-        "4️⃣  Под каждым сообщением кнопка\n"
-        "     <b>«Написать пользователю»</b> — один тап и вы в диалоге.\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        "💡 Подписку можно продлить в разделе <b>«Купить подписку»</b>."
-    )
-    await callback.message.edit_text(text, reply_markup=instruction_kb(), parse_mode="HTML")
+    await callback.message.edit_text(INSTRUCTION_TEXT, reply_markup=instruction_kb(), parse_mode="HTML")
     await callback.answer()
