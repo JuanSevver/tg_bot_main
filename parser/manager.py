@@ -1102,10 +1102,18 @@ class ParserManager:
         if not self._bot:
             return
 
+        # 1. Снимаем снапшот получателей одним запросом и СРАЗУ ЗАКРЫВАЕМ сессию.
+        # Раньше сессия держалась открытой всю доставку: autoflush на
+        # user.messages_received += 1 открывал write-транзакцию SQLite сразу
+        # же на первом sub_check, и она висела все ~N*0.04с до commit.
+        # Под нагрузкой это давало "database is locked" в realtime-handler'ах,
+        # потому что parsed_messages-инсерты ждали освобождения write-лока.
         async with async_session() as session:
             result = await session.execute(
-                select(User)
-                .join(UserCategory, UserCategory.user_id == User.id)
+                select(
+                    User.id, User.username,
+                    Subscription.expires_at,
+                ).join(UserCategory, UserCategory.user_id == User.id)
                 .join(Subscription, Subscription.user_id == User.id)
                 .where(
                     User.receiving_enabled == True,
@@ -1115,60 +1123,71 @@ class ParserManager:
                     Subscription.expires_at > datetime.utcnow(),
                 )
             )
-            users = result.scalars().all()
+            recipients = result.all()
 
-            from bot.keyboards.user_kb import message_action_kb
-            from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError
+        from bot.keyboards.user_kb import message_action_kb
+        from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError
+        from sqlalchemy import update
 
-            source = f"@{pm.author_username}" if pm.author_username else "Участник группы"
-            text = (
-                f"📨 <b>{cat.name}</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"{(pm.text or '')[:3500]}\n\n"
-                f"━━━━━━━━━━━━━━━━━━━━━\n"
-                f"👤 {source}"
-            )
-            kb = message_action_kb(pm.author_username, pm.author_link)
+        source = f"@{pm.author_username}" if pm.author_username else "Участник группы"
+        text = (
+            f"📨 <b>{cat.name}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"{(pm.text or '')[:3500]}\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"👤 {source}"
+        )
+        kb = message_action_kb(pm.author_username, pm.author_link)
 
-            now = datetime.utcnow()
-            for user in users:
-                # Доставка пачки занимает время — у юзера в её процессе могла
-                # истечь подписка. Повторная проверка дешевле, чем доставить
-                # «лишнее» сообщение после истечения.
-                sub_check = await session.execute(
-                    select(Subscription.expires_at).where(Subscription.user_id == user.id)
+        # 2. Шлём сообщения БЕЗ открытой сессии — никаких locks на parsed_messages
+        # пока крутится цикл доставки.
+        now = datetime.utcnow()
+        delivered_user_ids: list[int] = []
+        forbidden_user_ids: list[int] = []
+        for user_id, _username, expires_at in recipients:
+            # Recheck: за время доставки подписка могла истечь.
+            if not expires_at or expires_at <= now:
+                continue
+            try:
+                await _send_limiter.acquire()
+                await self._bot.send_message(
+                    user_id, text, reply_markup=kb, parse_mode="HTML",
                 )
-                exp = sub_check.scalar_one_or_none()
-                if not exp or exp <= now:
-                    continue
+                delivered_user_ids.append(user_id)
+            except TelegramRetryAfter as e:
+                logger.warning("RetryAfter %s sec, pausing delivery.", e.retry_after)
+                await asyncio.sleep(e.retry_after)
                 try:
-                    # Глобальный токен-бакет вместо локального sleep(0.04) —
-                    # 5 параллельных _deliver_message больше не дают суммарно 125/сек.
                     await _send_limiter.acquire()
                     await self._bot.send_message(
-                        user.id, text, reply_markup=kb, parse_mode="HTML",
+                        user_id, text, reply_markup=kb, parse_mode="HTML",
                     )
-                    user.messages_received += 1
-                except TelegramRetryAfter as e:
-                    # Telegram просит подождать — соблюдаем
-                    logger.warning("RetryAfter %s sec, pausing delivery.", e.retry_after)
-                    await asyncio.sleep(e.retry_after)
-                    try:
-                        await _send_limiter.acquire()
-                        await self._bot.send_message(
-                            user.id, text, reply_markup=kb, parse_mode="HTML",
-                        )
-                        user.messages_received += 1
-                    except Exception:
-                        pass
-                except TelegramForbiddenError:
-                    # Пользователь заблокировал бота — отключаем ему рассылку
-                    user.receiving_enabled = False
-                    logger.info("User %s blocked the bot, disabling delivery.", user.id)
-                except Exception as e:
-                    logger.debug("Deliver to user %s failed: %s", user.id, e)
+                    delivered_user_ids.append(user_id)
+                except Exception:
+                    pass
+            except TelegramForbiddenError:
+                forbidden_user_ids.append(user_id)
+                logger.info("User %s blocked the bot, disabling delivery.", user_id)
+            except Exception as e:
+                logger.debug("Deliver to user %s failed: %s", user_id, e)
 
-            await session.commit()
+        # 3. Один короткий write-транзакт в конце: обновляем счётчики
+        # и снимаем receiving_enabled у тех, кто заблокировал бота.
+        if delivered_user_ids or forbidden_user_ids:
+            async with async_session() as session:
+                if delivered_user_ids:
+                    await session.execute(
+                        update(User)
+                        .where(User.id.in_(delivered_user_ids))
+                        .values(messages_received=User.messages_received + 1)
+                    )
+                if forbidden_user_ids:
+                    await session.execute(
+                        update(User)
+                        .where(User.id.in_(forbidden_user_ids))
+                        .values(receiving_enabled=False)
+                    )
+                await session.commit()
 
 
 parser_manager = ParserManager()

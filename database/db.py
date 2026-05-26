@@ -10,9 +10,35 @@ async_session = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncS
 
 
 @event.listens_for(engine.sync_engine, "connect")
-def _enable_sqlite_fk(dbapi_conn, _):
+def _configure_sqlite(dbapi_conn, _):
+    """PRAGMA-настройки на каждый новый коннект SQLite.
+
+    foreign_keys=ON: SQLite по умолчанию игнорирует FK constraints, нам нужно
+        чтобы ON DELETE CASCADE работал.
+
+    journal_mode=WAL: Write-Ahead Logging — снимает основную причину
+        OperationalError "database is locked" под параллельной нагрузкой.
+        В классическом rollback-журнале один писатель блокирует ВСЕХ читателей
+        и других писателей. В WAL читатели не блокируют писателей и наоборот;
+        конкурируют только писатели между собой, и то — через короткий лок.
+        Для нашего workload (десятки realtime-хендлеров пишут в parsed_messages
+        одновременно) это снижает «database is locked» в десятки раз.
+
+    busy_timeout=5000: если конкурирующий писатель всё-таки попался, sqlite
+        будет ждать освобождения лока до 5 секунд вместо мгновенного фейла.
+        По умолчанию timeout=0 → любое пересечение даёт ошибку немедленно.
+
+    synchronous=NORMAL: компромисс между durability и скоростью записи.
+        FULL (default) делает fsync после каждого commit'а, что в нашем
+        потоке мелких INSERT'ов становится бутылочным горлом. NORMAL
+        достаточно безопасно для приложения: при краше может потеряться
+        последняя секунда транзакций, но БД не битая.
+    """
     cursor = dbapi_conn.cursor()
     cursor.execute("PRAGMA foreign_keys=ON")
+    cursor.execute("PRAGMA journal_mode=WAL")
+    cursor.execute("PRAGMA busy_timeout=5000")
+    cursor.execute("PRAGMA synchronous=NORMAL")
     cursor.close()
 
 
