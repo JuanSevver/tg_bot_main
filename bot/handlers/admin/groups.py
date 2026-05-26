@@ -263,25 +263,23 @@ async def process_group_link(message: Message, state: FSMContext, session: Async
         except Exception:
             pass
 
-    # Автоматически подписываем все парсерные аккаунты на новую группу.
-    # Без этого realtime-события Telegram не присылает — он шлёт NewMessage
-    # только участникам. _refresh_explicit_filter вызывается внутри join_group.
+    # Автоматически подписываем аккаунты на новую группу — но ТОЛЬКО если это
+    # приватная группа (по инвайт-ссылке). Для публичных вступление пропускается
+    # сознательно: анонимность парсера + экономия лимита каналов (~500/акк).
+    # Публичные ловятся коротким поллом (POLL_INTERVAL_SECONDS, ~60с), что
+    # обычно достаточно для бизнес-задач.
     join_summary = ""
     try:
         from parser.manager import parser_manager
         join_result = await parser_manager.join_group(link)
-        joined = sum(1 for v in join_result.values() if v in ("joined", "already"))
         total = len(join_result)
+        joined = sum(1 for v in join_result.values() if v in ("joined", "already"))
         skipped_public = sum(1 for v in join_result.values() if v.startswith("skipped"))
-        if skipped_public and skipped_public == total:
-            # Публичная группа: вступление пропущено сознательно.
-            # Реалтайм для не-членов Telegram не присылает, поэтому честно
-            # предупреждаем, что задержка до 5 минут (страховочный полл).
+        if skipped_public == total and total > 0:
+            # Публичная группа — вступление пропущено намеренно.
             join_summary = (
-                "\n⚠️ Публичная группа — аккаунты не подписаны, "
-                "новые сообщения подбираются <b>страховочным поллом раз в 5 минут</b>. "
-                "Для мгновенного realtime подпишите аккаунты на эту группу вручную "
-                "или используйте «👥 Подписать все аккаунты на все группы»."
+                "\nℹ️ Публичная группа — аккаунты не вступают (анонимность). "
+                "Новые сообщения подбираются <b>поллом ~1 раз в минуту</b>."
             )
         else:
             join_summary = f"\n👥 Аккаунтов подписано: {joined}/{total}"
@@ -290,7 +288,7 @@ async def process_group_link(message: Message, state: FSMContext, session: Async
             if failures:
                 join_summary += "\n⚠️ " + "; ".join(failures[:3])
     except Exception as e:
-        join_summary = f"\n⚠️ Авто-подписка не удалась: {e}"
+        join_summary = f"\n⚠️ Авто-подписка не удалась: {type(e).__name__}"
 
     type_label = "📢 Канал" if is_channel else "👥 Группа"
     display = title or link
@@ -356,9 +354,10 @@ async def cb_groups_join_all(callback: CallbackQuery, session: AsyncSession) -> 
         f"✅ Готово.\n\n"
         f"Новых вступлений: <b>{stats['joined']}</b>\n"
         f"Уже состояли: <b>{stats['already']}</b>\n"
-        f"Пропущено (публичные): <b>{stats['skipped']}</b>\n"
+        f"Пропущено (публичные, не вступаем): <b>{stats['skipped']}</b>\n"
         f"Не удалось: <b>{stats['failed']}</b>\n"
-        f"<i>Публичные группы парсятся напрямую без вступления.</i>"
+        f"<i>Публичные группы парсятся анонимно поллом ~1 раз в минуту "
+        f"без вступления.</i>"
     )
     if failures:
         summary += "\n\n⚠️ Проблемы:\n" + "\n".join(f"• {f}" for f in failures)

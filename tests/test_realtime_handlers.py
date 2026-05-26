@@ -509,27 +509,29 @@ class TestCollectMessagesGuard:
 # ─── Polling interval ─────────────────────────────────────────────────────────
 
 class TestPollingInterval:
-    def test_polling_sleep_is_300_seconds(self):
-        """The catchup polling loop must sleep >= 300 s, not the old 30 s."""
+    def test_polling_interval_constant_within_reasonable_range(self):
+        """POLL_INTERVAL_SECONDS должен быть в разумных пределах.
+
+        Раньше тест требовал >=300с (минимум 5 минут). После того как
+        мы намеренно отказались от вступления в публичные группы,
+        полл стал основным источником их сообщений → опустили до 60с.
+        Допускаем диапазон 30...600 с — за пределами либо флудим API
+        либо даём слишком большую задержку для публичных.
+        """
         import parser.manager as mod
 
+        assert hasattr(mod, "POLL_INTERVAL_SECONDS"), \
+            "POLL_INTERVAL_SECONDS должна быть вынесена в module-level константу"
+        interval = mod.POLL_INTERVAL_SECONDS
+        assert 30 <= interval <= 600, \
+            f"POLL_INTERVAL_SECONDS={interval} вне разумного диапазона [30, 600]"
+
+    def test_polling_loop_uses_constant(self):
+        """_polling_loop спит именно POLL_INTERVAL_SECONDS, а не магическое число."""
+        import parser.manager as mod
         src = inspect.getsource(mod.ParserManager._polling_loop)
-        tree = ast.parse(textwrap.dedent(src))
-
-        sleep_args = []
-        for node in ast.walk(tree):
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "sleep"
-                and node.args
-            ):
-                val = node.args[0]
-                if isinstance(val, ast.Constant):
-                    sleep_args.append(val.value)
-
-        loop_sleeps = [s for s in sleep_args if s > 10]
-        assert loop_sleeps, "No sleep > 10 s found in _polling_loop"
-        assert all(s >= 300 for s in loop_sleeps), (
-            f"Polling sleep must be >= 300 s, found: {loop_sleeps}"
+        # Должна быть ссылка на константу, не литерал
+        assert "POLL_INTERVAL_SECONDS" in src, (
+            "Polling loop должен использовать константу POLL_INTERVAL_SECONDS, "
+            "а не magic-number"
         )

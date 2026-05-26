@@ -48,6 +48,14 @@ DEDUP_WINDOW = timedelta(minutes=1)
 # не словить RetryAfter. См. _GlobalSendLimiter ниже.
 GLOBAL_SEND_RATE_PER_SEC = 25
 
+# Интервал страховочного полла. Realtime ловит сообщения мгновенно для групп,
+# где аккаунт состоит. Для публичных групп без вступления и для compense'a
+# обрывов realtime — догоняем поллом. Короткий интервал даёт задержку ~1 мин
+# для публичных групп, не флудит API при инкрементальном чтении (min_id).
+# При большом числе групп (100+) поднимите до 120-180с, чтобы не словить
+# FloodWait на iter_messages по всем подряд.
+POLL_INTERVAL_SECONDS = 60
+
 def _extract_username(link: str) -> str:
     """Нормализует ссылку на группу к юзернейму (без @, в нижнем регистре).
 
@@ -581,15 +589,20 @@ class ParserManager:
     # ------------------------------------------------------------------
 
     async def join_group(self, link_or_chat_id) -> dict:
-        """Подписывает все парсерные аккаунты на ПРИВАТНУЮ группу по инвайт-ссылке.
+        """Подписывает аккаунты на ПРИВАТНУЮ группу по инвайт-ссылке.
 
-        Публичные группы (`@x`, `t.me/x`) пропускаются — для них вступление не
-        требуется: парсер читает историю через get_entity+iter_messages у любого
-        аккаунта. Лимит ~500 каналов/аккаунт ценный, тратим его только на
-        приватные группы, где realtime без членства не работает.
+        Публичные группы (`@x`, `t.me/x`) пропускаются НАМЕРЕННО:
+        - анонимность: аккаунты не светятся в списке участников
+        - экономия лимита каналов (~500/аккаунт)
+        Realtime для них недоступен (Telegram присылает NewMessage только
+        участникам), но мы компенсируем это коротким POLL_INTERVAL (см. константу
+        наверху файла) — задержка до ~1 минуты.
 
-        Возвращает словарь {acc_id: status}, где status — одна из строк:
-        "joined", "already", "skipped: public", "error: <текст>".
+        Если для конкретной группы нужен мгновенный realtime, добавьте акк
+        вручную через Telegram-клиент и нажмите «🔄 Перезагрузить парсер»
+        (или просто рестартите контейнер — _refresh_explicit_filter подберёт).
+
+        Возвращает словарь {acc_id: status}.
         """
         from telethon.tl.functions.messages import ImportChatInviteRequest
         from telethon.errors import (
@@ -612,7 +625,8 @@ class ParserManager:
                 break
 
         if not invite_hash:
-            # Публичная группа — парсим напрямую, вступать не нужно.
+            # Публичная группа — вступать не будем (анонимность + лимит каналов).
+            # Realtime недоступен, но poll-interval короткий ⇒ задержка ~1 мин.
             for _, acc_id in self._client_pairs:
                 result[acc_id] = "skipped: public"
             return result
@@ -627,9 +641,6 @@ class ParserManager:
             except FloodWaitError as e:
                 result[acc_id] = f"floodwait {e.seconds}s"
                 logger.warning("FloodWait %s sec joining %s acc=%s", e.seconds, link, acc_id)
-                # Раньше было min(e.seconds, 10) — Telegram считает, что вы должны
-                # выждать ПОЛНУЮ задержку, иначе на следующем запросе flood удваивается
-                # вплоть до временного бана. Капать НЕЛЬЗЯ.
                 await asyncio.sleep(e.seconds)
             except (InviteHashExpiredError, InviteHashInvalidError) as e:
                 result[acc_id] = f"bad invite: {type(e).__name__}"
@@ -638,10 +649,8 @@ class ParserManager:
             except Exception as e:
                 result[acc_id] = f"error: {type(e).__name__}: {e}"
                 logger.debug("Join %s via acc %s failed: %s", link, acc_id, e)
-            await asyncio.sleep(0.5)  # лёгкий троттлинг чтобы не словить FloodWait
+            await asyncio.sleep(0.5)
 
-        # После массового вступления имеет смысл обновить realtime-фильтр —
-        # у группы мог появиться chat_id (если резолвится через get_entity)
         try:
             await self._refresh_explicit_filter()
         except Exception:
@@ -686,11 +695,14 @@ class ParserManager:
         self._explicit_usernames.update(new_usernames)
 
     async def _polling_loop(self) -> None:
-        """Страховочный поллинг — догоняет сообщения пропущенные при реконнекте.
+        """Страховочный + основной полл для не-joined публичных групп.
 
-        Основная доставка идёт через realtime-обработчики (NewMessage event).
-        Этот цикл запускается раз в 5 минут и обрабатывает только то,
-        что не попало в event stream (обрыв соединения, FloodWait и т.п.).
+        Realtime (NewMessage) работает только для групп где аккаунт состоит.
+        Для публичных групп, на которые мы намеренно не подписаны (анонимность),
+        этот цикл — единственный способ получить новые сообщения. Интервал
+        POLL_INTERVAL_SECONDS (60с по умолчанию) задаёт максимальную задержку.
+
+        Также догоняет сообщения, пропущенные при обрывах realtime-соединения.
         """
         # Первая итерация — сразу, чтобы подобрать историю после рестарта
         await asyncio.sleep(5)
@@ -702,7 +714,7 @@ class ParserManager:
                 await self._refresh_explicit_filter()
             except Exception as e:
                 logger.error("Catchup polling error: %s", e)
-            await asyncio.sleep(300)  # 5 минут
+            await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
     async def _invalid_retry_loop(self) -> None:
         """Раз в час пытается переподнять аккаунты, помеченные is_valid=False.
